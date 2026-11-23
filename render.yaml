@@ -3,7 +3,7 @@ services:
     name: stockflow-api
     runtime: node
     plan: free
-    buildCommand: npm ci && npm run build -w @wms/api
+    buildCommand: npm ci --include=dev && npm run build -w @wms/api
     startCommand: npm run start -w @wms/api
     healthCheckPath: /api/health
     envVars:
