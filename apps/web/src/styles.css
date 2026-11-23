@@ -448,7 +448,7 @@ tbody tr:last-child td { border-bottom: 0; }
 .rack3d-detail-content h3 { margin: 20px 0 6px; color: #607066; font-size: 9px; }
 .rack3d-detail .location-placeholder { max-width: 230px; }
 .rack3d-detail .rack-config-form { margin-top: 13px; }
-.rack-webgl-canvas { position: relative; width: 100%; height: 100%; min-width: 0; min-height: 320px; }
+.rack-webgl-canvas { position: relative; isolation: isolate; width: 100%; height: 100%; min-width: 0; min-height: 320px; }
 .rack-webgl-canvas canvas { display: block; width: 100%; height: 100%; touch-action: none; }
 .rack-webgl-hint { position: absolute; right: 12px; bottom: 10px; left: 12px; padding: 7px 9px; border: 1px solid #e5ebe7; border-radius: 5px; color: #64736a; background: #ffffffdc; text-align: center; font-size: 8px; pointer-events: none; }
 .rack3d-loading { display: grid; width: 100%; height: 100%; min-height: 320px; place-items: center; color: #6d8073; font-size: 11px; }

@@ -134,7 +134,7 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
                 emissiveIntensity={isSelected ? 0.25 : isHighlighted ? 0.12 : 0}
               />
             </mesh>
-            {showLocationLabels && number(location.quantity) > 0 && <Html position={[x, levelY + boxHeight + beamHeight / 2 + 0.08, 0]} center distanceFactor={8} style={{ pointerEvents: 'none', whiteSpace: 'nowrap' }}><span className="rack-bin-name">{location.display_name || location.code}</span></Html>}
+            {showLocationLabels && number(location.quantity) > 0 && <Html position={[x, levelY + boxHeight + beamHeight / 2 + 0.08, 0]} center distanceFactor={8} zIndexRange={[10, 0]} style={{ pointerEvents: 'none', whiteSpace: 'nowrap' }}><span className="rack-bin-name">{location.display_name || location.code}</span></Html>}
           </group>
         );
       })}

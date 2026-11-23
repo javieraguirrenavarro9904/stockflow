@@ -1045,7 +1045,7 @@ function InventoryPage({ products, locations, search, isAdmin, onAdd, onEdit, on
 }
 
 type RackCreationValues = {
-  aisleId: string; name: string; code: string; width: number; height: number;
+  aisleId: string; name: string; code: string; width: number; depth: number;
   binsPerLevel: number; levelHeights: number[];
 };
 
@@ -1075,26 +1075,35 @@ function makeRackLevelHeights(totalHeightCm: number, levelCount: number) {
   const minimum = Math.ceil(getMinimumRackHeightCm(levelCount));
   const maximum = getMaximumRackHeightCm(levelCount);
   const total = Math.max(minimum, Math.min(maximum, Math.round(totalHeightCm)));
+  if (levelCount === 1) {
+    const spacing = total <= RACK_BASE_HEIGHT_CM + RACK_TOP_CLEARANCE_CM + 96 + RACK_MAX_BOX_HEIGHT_CM
+      ? (total - RACK_BASE_HEIGHT_CM - RACK_TOP_CLEARANCE_CM) / 1.65
+      : total - RACK_BASE_HEIGHT_CM - RACK_TOP_CLEARANCE_CM - RACK_MAX_BOX_HEIGHT_CM;
+    return [Math.max(RACK_MIN_LEVEL_SPACING_CM, Math.min(1000, spacing))];
+  }
   const usableHeight = total - RACK_BASE_HEIGHT_CM - RACK_TOP_CLEARANCE_CM;
   let spacing = usableHeight / (levelCount + 0.65);
   if (spacing * 0.65 > RACK_MAX_BOX_HEIGHT_CM)
     spacing = (usableHeight - RACK_MAX_BOX_HEIGHT_CM) / levelCount;
   const wholeSpacing = Math.floor(spacing);
   const remainingCm = Math.round(spacing * levelCount) - wholeSpacing * levelCount;
-  return Array.from({ length: levelCount }, (_value, index) => wholeSpacing + (index < remainingCm ? 1 : 0));
+  const levelHeights = Array.from({ length: levelCount }, (_value, index) => wholeSpacing + (index < remainingCm ? 1 : 0));
+  levelHeights[0] += total - calculateRackHeightCm(levelHeights);
+  return levelHeights;
 }
 
 function maxRackBinsForWidth(widthCm: number) {
   return Math.max(1, Math.min(12, Math.floor((widthCm - 44) / 38)));
 }
 
-function RackCreationForm({ initialAisleId, initialWidth, initialHeight, maxWidth, existingCodes, onSubmit, onCancel }: {
-  initialAisleId: string; initialWidth: number; initialHeight: number; maxWidth: number;
+function RackCreationForm({ initialAisleId, initialWidth, initialDepth, maxWidth, maxDepth, existingCodes, onSubmit, onCancel }: {
+  initialAisleId: string; initialWidth: number; initialDepth: number; maxWidth: number; maxDepth: number;
   existingCodes: string[]; onSubmit: (values: RackCreationValues) => void; onCancel: () => void
 }) {
   const aisleId = initialAisleId;
   const [levelCount, setLevelCount] = useState(3);
   const [levelHeights, setLevelHeights] = useState(() => makeRackLevelHeights(240, 3));
+  const [rackHeightInput, setRackHeightInput] = useState(() => String(calculateRackHeightCm(makeRackLevelHeights(240, 3))));
   const [rackWidth, setRackWidth] = useState(initialWidth);
   const [binsPerLevel, setBinsPerLevel] = useState(Math.min(4, maxRackBinsForWidth(initialWidth)));
   const [codeError, setCodeError] = useState('');
@@ -1111,23 +1120,32 @@ function RackCreationForm({ initialAisleId, initialWidth, initialHeight, maxWidt
 
   const changeLevelCount = (value: number) => {
     const count = Math.max(1, Math.min(12, value));
-    const totalHeight = calculateRackHeightCm(levelHeights);
+    const totalHeight = Number(rackHeightInput) || calculateRackHeightCm(levelHeights);
+    const nextLevelHeights = makeRackLevelHeights(totalHeight, count);
     setLevelCount(count);
-    setLevelHeights(makeRackLevelHeights(totalHeight, count));
+    setLevelHeights(nextLevelHeights);
+    setRackHeightInput(String(calculateRackHeightCm(nextLevelHeights)));
   };
 
   return <form className="rack-wizard-form" onSubmit={(event) => {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
     const rackCode = String(form.get('code')).trim().toUpperCase();
+    const requestedHeight = Number(rackHeightInput);
+    const minimumHeight = Math.ceil(getMinimumRackHeightCm(levelCount));
+    const maximumHeight = getMaximumRackHeightCm(levelCount);
     if (existingCodes.some((existingCode) => existingCode.toUpperCase() === rackCode)) {
       setCodeError('Ya existe una estantería con este código.');
       return;
     }
-    if (calculateRackHeightCm(levelHeights) > RACK_MAX_HEIGHT_CM) {
-      setDimensionError('La altura total no puede superar los 1200 cm (12 m).');
+    if (!Number.isFinite(requestedHeight) || requestedHeight < minimumHeight || requestedHeight > maximumHeight) {
+      setDimensionError(`La altura total debe estar entre ${minimumHeight} y ${maximumHeight} cm.`);
       return;
     }
+    const submittedLevelHeights = makeRackLevelHeights(requestedHeight, levelCount);
+    const submittedHeight = calculateRackHeightCm(submittedLevelHeights);
+    setLevelHeights(submittedLevelHeights);
+    setRackHeightInput(String(submittedHeight));
     setCodeError('');
     setDimensionError('');
     onSubmit({
@@ -1135,9 +1153,9 @@ function RackCreationForm({ initialAisleId, initialWidth, initialHeight, maxWidt
       name: String(form.get('name')).trim(),
       code: rackCode,
       width: Number(form.get('width')),
-      height: Number(form.get('height')),
+      depth: Number(form.get('depth')),
       binsPerLevel: Number(form.get('binsPerLevel')),
-      levelHeights
+      levelHeights: submittedLevelHeights
     });
   }}>
     <p className="rack-wizard-intro">Configura la estructura y el espacio útil. La estantería aparecerá en 3D al crearla.</p>
@@ -1146,11 +1164,27 @@ function RackCreationForm({ initialAisleId, initialWidth, initialHeight, maxWidt
       const width = Number(event.target.value);
       setRackWidth(width);
       setBinsPerLevel((current) => Math.min(current, maxRackBinsForWidth(width)));
-    }} required /></label><label>Fondo (cm)<input name="height" type="number" min="130" max={initialHeight} step="10" defaultValue={initialHeight} required /></label></div>
+    }} required /></label><label>Fondo (cm)<input name="depth" type="number" min="130" max={maxDepth} step="10" defaultValue={initialDepth} required /></label></div>
     <div className="form-row"><label>Número de niveles<input type="number" min="1" max="12" value={levelCount} onChange={(event) => changeLevelCount(Number(event.target.value))} required /></label><label>Huecos por nivel<input name="binsPerLevel" type="number" min="1" max={maxRackBinsForWidth(rackWidth)} value={binsPerLevel} onChange={(event) => setBinsPerLevel(Math.max(1, Math.min(maxRackBinsForWidth(rackWidth), Number(event.target.value))))} required /></label></div>
-    <label>Altura total (cm)<input type="number" min={Math.ceil(getMinimumRackHeightCm(levelCount))} max={getMaximumRackHeightCm(levelCount)} value={calculateRackHeightCm(levelHeights)} onChange={(event) => setLevelHeights(makeRackLevelHeights(Number(event.target.value), levelCount))} required /><small className="field-help">Altura máxima: 1200 cm (12 m). Los niveles se reparten dentro de esta altura.</small></label>
+    <label>Altura total (cm)<input type="number" min={Math.ceil(getMinimumRackHeightCm(levelCount))} max={getMaximumRackHeightCm(levelCount)} value={rackHeightInput} onChange={(event) => {
+      const value = event.target.value;
+      setRackHeightInput(value);
+      if (value !== '' && Number.isFinite(Number(value)))
+        setLevelHeights(makeRackLevelHeights(Number(value), levelCount));
+    }} onBlur={() => {
+      const value = Number(rackHeightInput);
+      const nextLevelHeights = Number.isFinite(value)
+        ? makeRackLevelHeights(value, levelCount)
+        : levelHeights;
+      setLevelHeights(nextLevelHeights);
+      setRackHeightInput(String(calculateRackHeightCm(nextLevelHeights)));
+    }} required /><small className="field-help">Altura máxima: 1200 cm (12 m). Los niveles se reparten dentro de esta altura.</small></label>
     {dimensionError && <small className="rack-form-error">{dimensionError}</small>}
-    <div className="rack-wizard-levels"><strong>Separación vertical de cada nivel</strong><span>Se calcula desde la altura total; puedes ajustar cada balda.</span>{levelHeights.map((height, index) => <label key={index}><span>Nivel {index + 1}</span><input type="number" min={RACK_MIN_LEVEL_SPACING_CM} max="1000" value={height} onChange={(event) => setLevelHeights((current) => current.map((item, position) => position === index ? Number(event.target.value) : item))} required /><small>cm</small></label>)}</div>
+    <div className="rack-wizard-levels"><strong>Separación vertical de cada nivel</strong><span>Se calcula desde la altura total; puedes ajustar cada balda.</span>{levelHeights.map((height, index) => <label key={index}><span>Nivel {index + 1}</span><input type="number" min={RACK_MIN_LEVEL_SPACING_CM} max="1000" value={height} onChange={(event) => {
+      const nextLevelHeights = levelHeights.map((item, position) => position === index ? Number(event.target.value) : item);
+      setLevelHeights(nextLevelHeights);
+      setRackHeightInput(String(calculateRackHeightCm(nextLevelHeights)));
+    }} required /><small>cm</small></label>)}</div>
     <div className="form-actions"><button type="button" className="button button-secondary" onClick={onCancel}>Cancelar</button><button className="button button-primary"><Layers size={15} /> Crear estantería 3D</button></div>
   </form>;
 }
@@ -1643,13 +1677,13 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
       return;
     }
     const width = Math.min(480, number(warehouseDraft.map_width), 2000);
-    const height = Math.min(280, number(warehouseDraft.map_height), 1200);
+    const depth = Math.min(280, number(warehouseDraft.map_height), 1200);
     const mapWidth = number(warehouseDraft.map_width);
     const mapHeight = number(warehouseDraft.map_height);
     setRackWizard({
       aisleId: aisle.id,
       x: Math.max(0, Math.min(Math.round((x - width / 2) / MAP_GRID_SIZE) * MAP_GRID_SIZE, mapWidth - width)),
-      y: Math.max(0, Math.min(Math.round((y - height / 2) / MAP_GRID_SIZE) * MAP_GRID_SIZE, mapHeight - height))
+      y: Math.max(0, Math.min(Math.round((y - depth / 2) / MAP_GRID_SIZE) * MAP_GRID_SIZE, mapHeight - depth))
     });
   };
 
@@ -1726,7 +1760,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
     }
     const id = `draft-rack-${Date.now()}`;
     const width = Math.min(values.width, number(warehouseDraft.map_width));
-    const height = Math.max(130, Math.min(values.height, number(warehouseDraft.map_height)));
+    const height = Math.max(130, Math.min(values.depth, number(warehouseDraft.map_height), 1200));
     const rack: Rack = {
       id, aisle_id: aisle.id, aisle: aisle.code, zone: aisle.zone, name: values.name,
       code: values.code.trim().toUpperCase(),
@@ -1899,7 +1933,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
       </aside>
     </div>
     {rackWizard && <Modal title="Diseña tu estantería" onClose={() => setRackWizard(null)}>
-      <RackCreationForm initialAisleId={rackWizard.aisleId} initialWidth={Math.min(480, canvasWidth, 2000)} initialHeight={Math.min(280, canvasHeight, 1200)} maxWidth={Math.min(2000, canvasWidth)} existingCodes={rackDraft.map((rack) => rack.code)} onSubmit={createRackDraft} onCancel={() => setRackWizard(null)} />
+      <RackCreationForm initialAisleId={rackWizard.aisleId} initialWidth={Math.min(480, canvasWidth, 2000)} initialDepth={Math.min(280, canvasHeight, 1200)} maxWidth={Math.min(2000, canvasWidth)} maxDepth={Math.min(canvasHeight, 1200)} existingCodes={rackDraft.map((rack) => rack.code)} onSubmit={createRackDraft} onCancel={() => setRackWizard(null)} />
     </Modal>}
   </>;
 }
