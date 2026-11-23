@@ -243,6 +243,63 @@ app.post('/api/admin/employee-movement-alerts/read', requireAdmin, async (_req, 
   }
 });
 
+app.get('/api/admin/employee-movement-alerts/events', requireAdmin, async (_req, res, next) => {
+  let client: pg.PoolClient;
+  try {
+    client = await pool.connect();
+    const onNotification = (notification: { channel: string; payload?: string }) => {
+      if (notification.channel === 'employee_movement_alerts')
+        res.write(`event: movement\ndata: ${JSON.stringify({ movementId: notification.payload })}\n\n`);
+    };
+    client.on('notification', onNotification);
+    try {
+      await client.query('LISTEN employee_movement_alerts');
+    } catch (error) {
+      client.removeListener('notification', onNotification);
+      client.release();
+      throw error;
+    }
+
+    res.status(200).set({
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Accel-Buffering': 'no'
+    });
+    res.flushHeaders();
+    res.write('event: ready\ndata: {}\n\n');
+
+    let released = false;
+    const heartbeat = setInterval(() => res.write(': keep-alive\n\n'), 15000);
+    let cleanup = (_error?: Error) => {};
+    const onClientError = (error: Error) => {
+      console.error('Se perdió la conexión PostgreSQL de alertas:', error);
+      if (!res.writableEnded) res.end();
+      cleanup(error);
+    };
+    cleanup = (error?: Error) => {
+      if (released) return;
+      released = true;
+      clearInterval(heartbeat);
+      client.removeListener('notification', onNotification);
+      client.removeListener('error', onClientError);
+      client.release(error);
+    };
+    client.on('error', onClientError);
+    res.once('close', () => {
+      if (released) return;
+      clearInterval(heartbeat);
+      client.removeListener('notification', onNotification);
+      client.removeListener('error', onClientError);
+      void client.query('UNLISTEN employee_movement_alerts')
+        .catch((error) => console.error('No se pudo cerrar el canal de alertas:', error))
+        .finally(() => cleanup());
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.get('/api/warehouses', async (_req, res, next) => {
   try {
     const result = await pool.query('SELECT id, name, code, map_width, map_height FROM warehouses ORDER BY created_at, name');
@@ -770,6 +827,61 @@ function isValidPerimeter(perimeter: MapPoint[]): boolean {
   return true;
 }
 
+const maxRackHeightCm = 1200;
+const rackBaseHeightCm = 12;
+const rackTopClearanceCm = 10;
+const rackMaxBoxHeightCm = 62;
+const minRackLevelSpacingCm = 30;
+
+function calculateRackHeightCm(levelHeights: number[]) {
+  const lastLevelHeight = levelHeights.at(-1) ?? 0;
+  return rackBaseHeightCm + rackTopClearanceCm +
+    levelHeights.reduce((sum, height) => sum + height, 0) +
+    Math.min(rackMaxBoxHeightCm, Math.max(12, lastLevelHeight * 0.65));
+}
+
+function makeRackLevelHeights(totalHeightCm: number, levelCount: number) {
+  const minimum = rackBaseHeightCm + rackTopClearanceCm +
+    levelCount * minRackLevelSpacingCm + minRackLevelSpacingCm * 0.65;
+  const maximum = Math.min(maxRackHeightCm, rackBaseHeightCm + rackTopClearanceCm +
+    levelCount * 1000 + rackMaxBoxHeightCm);
+  const total = Math.max(Math.ceil(minimum), Math.min(maximum, Math.round(totalHeightCm)));
+  const usableHeight = total - rackBaseHeightCm - rackTopClearanceCm;
+  let spacing = usableHeight / (levelCount + 0.65);
+  if (spacing * 0.65 > rackMaxBoxHeightCm)
+    spacing = (usableHeight - rackMaxBoxHeightCm) / levelCount;
+  const wholeSpacing = Math.floor(spacing);
+  const remainingCm = Math.round(spacing * levelCount) - wholeSpacing * levelCount;
+  return Array.from({ length: levelCount }, (_value, index) => wholeSpacing + (index < remainingCm ? 1 : 0));
+}
+
+function maxRackBinsForWidth(widthCm: number) {
+  return Math.max(1, Math.min(12, Math.floor((widthCm - 44) / 38)));
+}
+
+function rackBinModuleWidth(widthCm: number, binsPerLevel: number) {
+  return Math.max(5, Math.floor((widthCm - 44) / binsPerLevel) - 6);
+}
+
+const rackLayoutSchema = z.object({
+  id: z.string().uuid().optional(),
+  clientId: z.string().min(1).max(80).optional(),
+  aisleId: z.string().min(1).max(80),
+  name: z.string().trim().min(2).max(100),
+  code: z.string().trim().regex(/^[A-Z0-9-]{2,24}$/),
+  map_x: z.coerce.number().min(0).max(30000),
+  map_y: z.coerce.number().min(0).max(30000),
+  map_width: z.coerce.number().min(160).max(2000),
+  map_height: z.coerce.number().min(130).max(1200),
+  binsPerLevel: z.coerce.number().int().min(1).max(12),
+  levelHeights: z.array(z.coerce.number().min(minRackLevelSpacingCm).max(1000)).min(1).max(12)
+}).superRefine((rack, ctx) => {
+  if (!rack.id && rack.map_width < 220)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['map_width'], message: 'El ancho mínimo de una estantería nueva es 220 cm' });
+  if (calculateRackHeightCm(rack.levelHeights) > maxRackHeightCm)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['levelHeights'], message: 'La altura total de una estantería no puede superar 1200 cm (12 m)' });
+});
+
 const mapLayoutSchema = z.object({
   warehouse: z.object({
     map_width: z.coerce.number().int().min(520).max(30000),
@@ -790,19 +902,7 @@ const mapLayoutSchema = z.object({
     map_width: z.coerce.number().min(100).max(4000),
     map_height: z.coerce.number().min(80).max(4000)
   })).max(100),
-  racks: z.array(z.object({
-    id: z.string().uuid().optional(),
-    clientId: z.string().min(1).max(80).optional(),
-    aisleId: z.string().min(1).max(80),
-    name: z.string().trim().min(2).max(100),
-    code: z.string().trim().regex(/^[A-Z0-9-]{2,24}$/),
-    map_x: z.coerce.number().min(0).max(30000),
-    map_y: z.coerce.number().min(0).max(30000),
-    map_width: z.coerce.number().min(220).max(1600),
-    map_height: z.coerce.number().min(130).max(1200),
-    binsPerLevel: z.coerce.number().int().min(1).max(12),
-    levelHeights: z.array(z.coerce.number().min(1).max(1000)).min(1).max(12)
-  })).max(200),
+  racks: z.array(rackLayoutSchema).max(200),
   deleteRackIds: z.array(z.string().uuid()).max(200),
   deleteAisleIds: z.array(z.string().uuid()).max(100)
 });
@@ -921,6 +1021,8 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
         const previous = current.rows[0] as { id: string; level_count: number; bins_per_level: number };
         if (rack.levelHeights.length < previous.level_count || rack.binsPerLevel < previous.bins_per_level)
           throw Object.assign(new Error(`No se pueden eliminar niveles o ubicaciones existentes de ${rack.code}`), { status: 409 });
+        if (rack.binsPerLevel > previous.bins_per_level && rack.binsPerLevel > maxRackBinsForWidth(rack.map_width))
+          throw Object.assign(new Error(`El ancho de ${rack.code} no permite añadir tantos huecos por nivel`), { status: 400 });
         await client.query(
           `UPDATE racks SET aisle_id = $1, name = $2, code = $3, map_x = $4, map_y = $5, map_width = $6, map_height = $7
            WHERE id = $8`,
@@ -928,7 +1030,7 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
         );
         rackId = rack.id;
         const levels = await client.query('SELECT id, level_number FROM rack_levels WHERE rack_id = $1 ORDER BY level_number', [rackId]);
-        const binWidth = Math.max(32, Math.floor((rack.map_width - 44) / rack.binsPerLevel) - 6);
+        const binWidth = rackBinModuleWidth(rack.map_width, rack.binsPerLevel);
         const binHeight = Math.max(20, Math.floor((rack.map_height - 56) / rack.levelHeights.length) - 8);
         for (const level of levels.rows as { id: string; level_number: number }[]) {
           await client.query('UPDATE rack_levels SET height_cm = $1 WHERE id = $2', [rack.levelHeights[level.level_number - 1], level.id]);
@@ -969,13 +1071,15 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
           }
         }
       } else {
+        if (rack.binsPerLevel > maxRackBinsForWidth(rack.map_width))
+          throw Object.assign(new Error(`El ancho de ${rack.code} no permite tantos huecos por nivel`), { status: 400 });
         const inserted = await client.query(
           `INSERT INTO racks (aisle_id, name, code, map_x, map_y, map_width, map_height)
            VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
           [aisleId, rack.name, rack.code, rack.map_x, rack.map_y, rack.map_width, rack.map_height]
         );
         rackId = inserted.rows[0].id as string;
-        const binWidth = Math.max(32, Math.floor((rack.map_width - 44) / rack.binsPerLevel) - 6);
+        const binWidth = rackBinModuleWidth(rack.map_width, rack.binsPerLevel);
         const binHeight = Math.max(20, Math.floor((rack.map_height - 56) / rack.levelHeights.length) - 8);
         for (let levelNumber = 1; levelNumber <= rack.levelHeights.length; levelNumber += 1) {
           const level = await client.query(
@@ -1146,7 +1250,7 @@ app.put('/api/locations/:id/expected-content', requireAdmin, async (req, res, ne
 });
 
 const binWidthSchema = z.object({
-  widthUnits: z.coerce.number().int().min(1).max(4)
+  widthUnits: z.coerce.number().int().min(1).max(12)
 });
 
 async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: string, widthUnits: number) {
@@ -1214,7 +1318,7 @@ async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: st
   const childIds = resolvedSlots.filter((slot) => slot.id !== anchor.id).map((slot) => slot.id);
   if (childIds.length)
     await client.query('UPDATE bins SET merged_into_bin_id = $1 WHERE id = ANY($2::uuid[])', [anchor.id, childIds]);
-  const moduleWidth = Math.max(32, Math.floor((Number(anchor.rack_map_width) - 44) / Number(anchor.slots_per_level)) - 6);
+  const moduleWidth = rackBinModuleWidth(Number(anchor.rack_map_width), Number(anchor.slots_per_level));
   const mapWidth = moduleWidth * widthUnits + 6 * (widthUnits - 1);
   await client.query('UPDATE bins SET width_units = $1, map_width = $2 WHERE id = $3', [widthUnits, mapWidth, anchor.id]);
 }
@@ -1223,7 +1327,7 @@ app.put('/api/locations/:id/width', requireAdmin, async (req, res, next) => {
   const parsedId = z.string().uuid().safeParse(req.params.id);
   const parsed = binWidthSchema.safeParse(req.body);
   if (!parsedId.success) return res.status(400).json({ error: 'Identificador de ubicación no válido' });
-  if (!parsed.success) return res.status(400).json({ error: 'Tamaño de caja no válido. Elige entre 1 y 4 huecos.' });
+  if (!parsed.success) return res.status(400).json({ error: 'Tamaño de caja no válido. Elige entre 1 y 12 huecos contiguos.' });
   const warehouseId = res.locals.warehouseId as string;
   const client = await pool.connect();
   try {
@@ -1362,18 +1466,32 @@ const rackConfigFields = {
   binsPerLevel: z.coerce.number().int().min(1).max(12),
   map_x: z.coerce.number().min(0).max(30000),
   map_y: z.coerce.number().min(0).max(30000),
-  map_width: z.coerce.number().min(220).max(1600),
-  map_height: z.coerce.number().min(130).max(1200)
+  map_width: z.coerce.number().min(160).max(2000),
+  map_height: z.coerce.number().min(130).max(1200),
+  rackHeightCm: z.coerce.number().int().min(100).max(maxRackHeightCm).optional()
 };
 
 function validateRackDimensions(
-  value: { levelCount: number; binsPerLevel: number; map_height: number },
+  value: { levelCount: number; binsPerLevel: number; map_height: number; map_width: number; rackHeightCm?: number },
   ctx: z.RefinementCtx
 ) {
   if (value.levelCount * value.binsPerLevel > 100)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['binsPerLevel'], message: 'Una estantería no puede superar 100 ubicaciones' });
   if (value.map_height < 48 + value.levelCount * 22)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['map_height'], message: 'Aumenta la altura para que quepan todos los niveles' });
+  const levelHeights = value.rackHeightCm === undefined
+    ? Array.from({ length: value.levelCount }, () => 240)
+    : makeRackLevelHeights(value.rackHeightCm, value.levelCount);
+  if (calculateRackHeightCm(levelHeights) > maxRackHeightCm)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['rackHeightCm'], message: 'La altura total de una estantería no puede superar 1200 cm (12 m)' });
+  if (value.rackHeightCm !== undefined &&
+      value.rackHeightCm < rackBaseHeightCm + rackTopClearanceCm +
+        value.levelCount * minRackLevelSpacingCm + minRackLevelSpacingCm * 0.65)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['rackHeightCm'], message: 'La altura total no permite el espacio mínimo para tantos niveles' });
+  if (value.rackHeightCm !== undefined &&
+      value.rackHeightCm > Math.min(maxRackHeightCm, rackBaseHeightCm + rackTopClearanceCm +
+        value.levelCount * 1000 + rackMaxBoxHeightCm))
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['rackHeightCm'], message: 'La altura total es demasiado grande para el número de niveles' });
 }
 
 const rackConfigSchema = z.object(rackConfigFields).superRefine(validateRackDimensions);
@@ -1397,12 +1515,15 @@ function makeLocationCode(prefix: LocationCodePrefix, rackCode: string, level: n
 }
 
 async function addRackBins(client: pg.PoolClient, rackId: string, config: z.infer<typeof rackConfigSchema>, prefix: LocationCodePrefix) {
-  const binWidth = Math.max(32, Math.floor((config.map_width - 44) / config.binsPerLevel) - 6);
+  const binWidth = rackBinModuleWidth(config.map_width, config.binsPerLevel);
   const binHeight = Math.max(20, Math.floor((config.map_height - 56) / config.levelCount) - 8);
+  const levelHeights = config.rackHeightCm === undefined
+    ? Array.from({ length: config.levelCount }, () => 240)
+    : makeRackLevelHeights(config.rackHeightCm, config.levelCount);
   for (let level = 1; level <= config.levelCount; level += 1) {
     const insertedLevel = await client.query(
-      'INSERT INTO rack_levels (rack_id, level_number) VALUES ($1, $2) RETURNING id',
-      [rackId, level]
+      'INSERT INTO rack_levels (rack_id, level_number, height_cm) VALUES ($1, $2, $3) RETURNING id',
+      [rackId, level, levelHeights[level - 1]]
     );
     for (let position = 1; position <= config.binsPerLevel; position += 1) {
       const { code, barcode } = makeLocationCode(prefix, config.code, level, position);
@@ -1424,6 +1545,12 @@ app.post('/api/racks', requireAdmin, async (req, res, next) => {
   const parsed = rackConfigSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Configuración de estantería no válida', details: parsed.error.flatten() });
   const config = parsed.data;
+  if (config.map_width < 220) return res.status(400).json({ error: 'El ancho mínimo de una estantería nueva es 220 cm' });
+  if (config.binsPerLevel > maxRackBinsForWidth(config.map_width))
+    return res.status(400).json({ error: 'El ancho no permite tantos huecos por nivel' });
+  if (config.rackHeightCm === undefined &&
+      calculateRackHeightCm(Array.from({ length: config.levelCount }, () => 240)) > maxRackHeightCm)
+    return res.status(400).json({ error: 'Indica una altura total para evitar que la estantería supere 1200 cm (12 m)' });
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
@@ -1486,6 +1613,8 @@ app.patch('/api/racks/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, nex
     const codePrefix = await getLocationCodePrefix(client, existing.aisle_id, res.locals.warehouseId as string);
     if (config.levelCount < existing.level_count || config.binsPerLevel < existing.bins_per_level)
       throw Object.assign(new Error('No se pueden eliminar niveles o ubicaciones existentes. Puedes ampliarlos sin perder el historial.'), { status: 409 });
+    if (config.binsPerLevel > existing.bins_per_level && config.binsPerLevel > maxRackBinsForWidth(config.map_width))
+      throw Object.assign(new Error('El ancho no permite añadir tantos huecos por nivel'), { status: 400 });
 
     await client.query(
       `UPDATE racks SET name = $1, code = $2, map_x = $3, map_y = $4, map_width = $5, map_height = $6 WHERE id = $7`,
@@ -1499,12 +1628,23 @@ app.patch('/api/racks/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, nex
     );
 
     const levels = await client.query(
-      'SELECT id, level_number FROM rack_levels WHERE rack_id = $1 ORDER BY level_number',
+      'SELECT id, level_number, height_cm FROM rack_levels WHERE rack_id = $1 ORDER BY level_number',
       [req.params.id]
     );
-    const binWidth = Math.max(32, Math.floor((config.map_width - 44) / config.binsPerLevel) - 6);
+    const existingLevels = levels.rows as { id: string; level_number: number; height_cm: string | number }[];
+    const requestedLevelHeights = config.rackHeightCm === undefined
+      ? null
+      : makeRackLevelHeights(config.rackHeightCm, config.levelCount);
+    const finalLevelHeights = requestedLevelHeights ?? Array.from({ length: config.levelCount }, (_value, index) =>
+      Number(existingLevels.find((level) => level.level_number === index + 1)?.height_cm ?? 240)
+    );
+    if (calculateRackHeightCm(finalLevelHeights) > maxRackHeightCm)
+      throw Object.assign(new Error('La altura total de una estantería no puede superar 1200 cm (12 m)'), { status: 400 });
+    const binWidth = rackBinModuleWidth(config.map_width, config.binsPerLevel);
     const binHeight = Math.max(20, Math.floor((config.map_height - 56) / config.levelCount) - 8);
-    for (const level of levels.rows as { id: string; level_number: number }[]) {
+    for (const level of existingLevels) {
+      if (requestedLevelHeights)
+        await client.query('UPDATE rack_levels SET height_cm = $1 WHERE id = $2', [requestedLevelHeights[level.level_number - 1], level.id]);
       const bins = await client.query('SELECT id, width_units FROM bins WHERE rack_level_id = $1 ORDER BY code', [level.id]);
       for (let index = 0; index < bins.rows.length; index += 1) {
         const { code, barcode } = makeLocationCode(codePrefix, config.code, level.level_number, index + 1);
@@ -1523,7 +1663,8 @@ app.patch('/api/racks/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, nex
       }
     }
     for (let levelNumber = existing.level_count + 1; levelNumber <= config.levelCount; levelNumber += 1) {
-      const level = await client.query('INSERT INTO rack_levels (rack_id, level_number) VALUES ($1, $2) RETURNING id', [req.params.id, levelNumber]);
+      const heightCm = requestedLevelHeights?.[levelNumber - 1] ?? 240;
+      const level = await client.query('INSERT INTO rack_levels (rack_id, level_number, height_cm) VALUES ($1, $2, $3) RETURNING id', [req.params.id, levelNumber, heightCm]);
       for (let position = 1; position <= config.binsPerLevel; position += 1) {
         const { code, barcode } = makeLocationCode(codePrefix, config.code, levelNumber, position);
         await client.query(
@@ -1651,7 +1792,7 @@ const movementSchema = z.object({
   fromBinId: z.string().uuid().optional(),
   toBinId: z.string().uuid().optional(),
   binName: z.string().trim().min(1).max(100).optional(),
-  binWidthUnits: z.coerce.number().int().min(1).max(4).optional(),
+  binWidthUnits: z.coerce.number().int().min(1).max(12).optional(),
   destinationWarehouseId: z.string().uuid().optional(),
   reference: z.string().trim().max(120).optional()
 }).superRefine((data, ctx) => {
@@ -2511,7 +2652,7 @@ async function start() {
       ALTER TABLE racks ADD COLUMN IF NOT EXISTS map_width NUMERIC(7, 2) NOT NULL DEFAULT 480;
       ALTER TABLE racks ADD COLUMN IF NOT EXISTS map_height NUMERIC(7, 2) NOT NULL DEFAULT 280;
       ALTER TABLE racks DROP CONSTRAINT IF EXISTS racks_map_width_check;
-      ALTER TABLE racks ADD CONSTRAINT racks_map_width_check CHECK (map_width BETWEEN 160 AND 1600);
+      ALTER TABLE racks ADD CONSTRAINT racks_map_width_check CHECK (map_width BETWEEN 160 AND 2000);
       ALTER TABLE racks DROP CONSTRAINT IF EXISTS racks_map_height_check;
       ALTER TABLE racks ADD CONSTRAINT racks_map_height_check CHECK (map_height BETWEEN 100 AND 1200);
       ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS map_width NUMERIC(7, 2) NOT NULL DEFAULT 5000;
@@ -2569,6 +2710,10 @@ async function start() {
     ));
     await pool.query(readFileSync(
       resolve(apiRoot, 'src/db/migrations/008-employee-movement-alerts.sql'),
+      'utf8'
+    ));
+    await pool.query(readFileSync(
+      resolve(apiRoot, 'src/db/migrations/009-rack-dimensions.sql'),
       'utf8'
     ));
     await pool.query(`

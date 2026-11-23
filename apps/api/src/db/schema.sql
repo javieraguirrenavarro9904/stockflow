@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS racks (
   code TEXT NOT NULL,
   map_x NUMERIC(7, 2) NOT NULL DEFAULT 30,
   map_y NUMERIC(7, 2) NOT NULL DEFAULT 30,
-  map_width NUMERIC(7, 2) NOT NULL DEFAULT 480 CHECK (map_width BETWEEN 160 AND 1600),
+  map_width NUMERIC(7, 2) NOT NULL DEFAULT 480 CHECK (map_width BETWEEN 160 AND 2000),
   map_height NUMERIC(7, 2) NOT NULL DEFAULT 280 CHECK (map_height BETWEEN 100 AND 1200),
   UNIQUE (aisle_id, code)
 );
@@ -184,6 +184,29 @@ CREATE TABLE IF NOT EXISTS movement_lines (
   to_bin_id UUID REFERENCES bins(id),
   CHECK (from_bin_id IS NOT NULL OR to_bin_id IS NOT NULL)
 );
+
+CREATE OR REPLACE FUNCTION notify_admin_of_employee_movement()
+RETURNS TRIGGER
+LANGUAGE plpgsql
+AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM users WHERE id = NEW.created_by AND role = 'employee') THEN
+    INSERT INTO employee_movement_alerts (movement_id)
+    VALUES (NEW.id)
+    ON CONFLICT (movement_id) DO NOTHING;
+    IF FOUND THEN
+      PERFORM pg_notify('employee_movement_alerts', NEW.id::text);
+    END IF;
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS employee_movement_alert_trigger ON movements;
+CREATE TRIGGER employee_movement_alert_trigger
+AFTER INSERT ON movements
+FOR EACH ROW
+EXECUTE FUNCTION notify_admin_of_employee_movement();
 
 CREATE INDEX IF NOT EXISTS idx_stock_product ON stock_balances(product_id);
 CREATE INDEX IF NOT EXISTS idx_stock_bin ON stock_balances(bin_id);

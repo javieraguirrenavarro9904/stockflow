@@ -272,22 +272,66 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
   useEffect(() => {
     if (!isAdmin) return;
     let active = true;
-    const loadAlerts = () => {
-      void request<{ alerts: EmployeeMovementAlert[]; unreadCount: number }>('/admin/employee-movement-alerts')
-        .then((result) => {
-          if (!active) return;
-          setEmployeeMovementAlerts(result.alerts);
-          setUnreadEmployeeMovementAlerts(result.unreadCount);
-        })
-        .catch((reason) => {
-          if (active) setError(reason instanceof Error ? reason.message : 'No se pudieron cargar las alertas de movimientos');
-        });
+    const controller = new AbortController();
+    const loadAlerts = async () => {
+      try {
+        const result = await request<{ alerts: EmployeeMovementAlert[]; unreadCount: number }>('/admin/employee-movement-alerts');
+        if (!active) return;
+        setEmployeeMovementAlerts(result.alerts);
+        setUnreadEmployeeMovementAlerts(result.unreadCount);
+      } catch (reason) {
+        if (active) setError(reason instanceof Error ? reason.message : 'No se pudieron cargar las alertas de movimientos');
+      }
     };
-    loadAlerts();
-    const intervalId = window.setInterval(loadAlerts, 30000);
+    const connectToAlertEvents = async () => {
+      while (active) {
+        try {
+          const response = await fetch(`${API}/admin/employee-movement-alerts/events`, {
+            headers: { Accept: 'text/event-stream', Authorization: `Bearer ${authToken}` },
+            signal: controller.signal
+          });
+          if (response.status === 401) {
+            window.dispatchEvent(new Event('stockflow:unauthorized'));
+            return;
+          }
+          if (!response.ok || !response.body) throw new Error('No se pudo conectar con las alertas en tiempo real');
+          const reader = response.body.getReader();
+          const decoder = new TextDecoder();
+          let buffer = '';
+          while (active) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
+            let boundary = buffer.indexOf('\n\n');
+            while (boundary >= 0) {
+              const message = buffer.slice(0, boundary);
+              buffer = buffer.slice(boundary + 2);
+              const eventName = message.split('\n').find((line) => line.startsWith('event:'))?.slice(6).trim();
+              if (eventName === 'ready' || eventName === 'movement') void loadAlerts();
+              boundary = buffer.indexOf('\n\n');
+            }
+          }
+        } catch (reason) {
+          if (!active || controller.signal.aborted) break;
+          console.error('Conexión de alertas interrumpida; se reintentará:', reason);
+        }
+        if (active) await new Promise((resolve) => window.setTimeout(resolve, 3000));
+      }
+    };
+    void loadAlerts();
+    void connectToAlertEvents();
+    const intervalId = window.setInterval(() => void loadAlerts(), 30000);
+    const refreshVisibleAlerts = () => {
+      if (document.visibilityState === 'visible') void loadAlerts();
+    };
+    window.addEventListener('focus', refreshVisibleAlerts);
+    document.addEventListener('visibilitychange', refreshVisibleAlerts);
     return () => {
       active = false;
+      controller.abort();
       window.clearInterval(intervalId);
+      window.removeEventListener('focus', refreshVisibleAlerts);
+      document.removeEventListener('visibilitychange', refreshVisibleAlerts);
     };
   }, [isAdmin]);
 
@@ -815,8 +859,8 @@ function SettingsPage({ user, users, categories, suppliers, employeeMovementAler
           {!users.length && <div className="table-empty">Cargando usuarios…</div>}</div>
         <div className="team-footnote"><ShieldCheck size={14} /> Desactivar una cuenta cierra también las sesiones abiertas.</div>
       </section>}
-      {isAdmin && <CatalogManagement categories={categories} suppliers={suppliers} onCreate={onCreateCatalogEntry} onDelete={onDeleteCatalogEntry} />}
       {isAdmin && <EmployeeMovementAlerts alerts={employeeMovementAlerts} unreadCount={unreadEmployeeMovementAlerts} onMarkRead={onMarkEmployeeAlertsRead} />}
+      {isAdmin && <CatalogManagement categories={categories} suppliers={suppliers} onCreate={onCreateCatalogEntry} onDelete={onDeleteCatalogEntry} />}
       {!isAdmin && <section className="panel employee-permissions"><div className="settings-section-title"><Users size={16} /><strong>Permisos del empleado</strong></div><p>Puedes consultar el inventario, registrar movimientos, explorar el mapa y utilizar el asistente. La configuración de productos y estanterías está reservada a administradores.</p></section>}
     </div>
   </>;
@@ -918,12 +962,14 @@ function WarehouseForm({ onSubmit, onCancel }: { onSubmit: (event: FormEvent<HTM
 function RackConfigForm({ rack, onChange, onDelete }: {
   rack: Rack; onChange: (field: string, value: string | number) => void; onDelete: () => void
 }) {
+  const maximumBins = Math.max(rack.bins_per_level, maxRackBinsForWidth(number(rack.map_width)));
+  const totalHeight = calculateRackHeightCm(rack.level_heights.map(number));
   return <div className="rack-config-form">
     <label>Nombre<input required minLength={2} maxLength={100} value={rack.name} onChange={(event) => onChange('name', event.target.value)} /></label>
     <label>Código<input required pattern="[A-Za-z0-9-]{2,24}" value={rack.code} onChange={(event) => onChange('code', event.target.value.toUpperCase())} /></label>
-    <div className="form-row"><label>Niveles<input type="number" min={rack.level_count} max="12" value={rack.level_count} onChange={(event) => onChange('level_count', Number(event.target.value))} /></label><label>Ubicaciones / nivel<input type="number" min={rack.bins_per_level} max="12" value={rack.bins_per_level} onChange={(event) => onChange('bins_per_level', Number(event.target.value))} /></label></div>
-    <div className="form-row"><label>Ancho (cm)<input type="number" min="220" max="1600" step="10" value={number(rack.map_width)} onChange={(event) => onChange('map_width', Number(event.target.value))} /></label><label>Fondo (cm)<input type="number" min="130" max="1200" step="10" value={number(rack.map_height)} onChange={(event) => onChange('map_height', Number(event.target.value))} /></label></div>
-    <div className="rack-level-heights"><strong>Altura de cada nivel</strong>{rack.level_heights.map((height, index) => <label key={index}>Nivel {index + 1} (cm)<input type="number" min="1" max="1000" value={number(height)} onChange={(event) => onChange(`height_${index}`, Number(event.target.value))} /></label>)}</div>
+    <div className="form-row"><label>Niveles<input type="number" min={rack.level_count} max="12" value={rack.level_count} onChange={(event) => onChange('level_count', Number(event.target.value))} /></label><label>Huecos / nivel<input type="number" min={rack.bins_per_level} max={maximumBins} value={rack.bins_per_level} onChange={(event) => onChange('bins_per_level', Number(event.target.value))} /></label></div>
+    <div className="form-row"><label>Ancho (cm)<input type="number" min={Math.min(220, number(rack.map_width))} max="2000" step="10" value={number(rack.map_width)} onChange={(event) => onChange('map_width', Number(event.target.value))} /></label><label>Fondo (cm)<input type="number" min="130" max="1200" step="10" value={number(rack.map_height)} onChange={(event) => onChange('map_height', Number(event.target.value))} /></label></div>
+    <div className="rack-level-heights"><strong>Separación vertical de cada nivel</strong><span>Altura total: {totalHeight} cm · máximo 1200 cm</span>{rack.level_heights.map((height, index) => <label key={index}>Nivel {index + 1} (cm)<input type="number" min="30" max="1000" value={number(height)} onChange={(event) => onChange(`height_${index}`, Number(event.target.value))} /></label>)}</div>
     <small className="rack-config-note">Los niveles y huecos con historial no se pueden reducir ni eliminar.</small>
     <button className="button button-danger full-button" onClick={onDelete}><Archive size={15} /> Eliminar estantería</button>
   </div>;
@@ -1003,14 +1049,56 @@ type RackCreationValues = {
   binsPerLevel: number; levelHeights: number[];
 };
 
-function RackCreationForm({ initialAisleId, initialWidth, initialHeight, existingCodes, onSubmit, onCancel }: {
-  initialAisleId: string; initialWidth: number; initialHeight: number;
+const RACK_BASE_HEIGHT_CM = 12;
+const RACK_TOP_CLEARANCE_CM = 10;
+const RACK_MAX_BOX_HEIGHT_CM = 62;
+const RACK_MIN_LEVEL_SPACING_CM = 30;
+const RACK_MAX_HEIGHT_CM = 1200;
+
+function calculateRackHeightCm(levelHeights: number[]) {
+  const lastLevel = levelHeights.at(-1) ?? 0;
+  const boxHeight = Math.min(RACK_MAX_BOX_HEIGHT_CM, Math.max(12, lastLevel * 0.65));
+  return Math.round(RACK_BASE_HEIGHT_CM + levelHeights.reduce((sum, height) => sum + height, 0) + boxHeight + RACK_TOP_CLEARANCE_CM);
+}
+
+function getMinimumRackHeightCm(levelCount: number) {
+  return RACK_BASE_HEIGHT_CM + RACK_TOP_CLEARANCE_CM +
+    levelCount * RACK_MIN_LEVEL_SPACING_CM + RACK_MIN_LEVEL_SPACING_CM * 0.65;
+}
+
+function getMaximumRackHeightCm(levelCount: number) {
+  return Math.min(RACK_MAX_HEIGHT_CM, RACK_BASE_HEIGHT_CM + RACK_TOP_CLEARANCE_CM +
+    levelCount * 1000 + RACK_MAX_BOX_HEIGHT_CM);
+}
+
+function makeRackLevelHeights(totalHeightCm: number, levelCount: number) {
+  const minimum = Math.ceil(getMinimumRackHeightCm(levelCount));
+  const maximum = getMaximumRackHeightCm(levelCount);
+  const total = Math.max(minimum, Math.min(maximum, Math.round(totalHeightCm)));
+  const usableHeight = total - RACK_BASE_HEIGHT_CM - RACK_TOP_CLEARANCE_CM;
+  let spacing = usableHeight / (levelCount + 0.65);
+  if (spacing * 0.65 > RACK_MAX_BOX_HEIGHT_CM)
+    spacing = (usableHeight - RACK_MAX_BOX_HEIGHT_CM) / levelCount;
+  const wholeSpacing = Math.floor(spacing);
+  const remainingCm = Math.round(spacing * levelCount) - wholeSpacing * levelCount;
+  return Array.from({ length: levelCount }, (_value, index) => wholeSpacing + (index < remainingCm ? 1 : 0));
+}
+
+function maxRackBinsForWidth(widthCm: number) {
+  return Math.max(1, Math.min(12, Math.floor((widthCm - 44) / 38)));
+}
+
+function RackCreationForm({ initialAisleId, initialWidth, initialHeight, maxWidth, existingCodes, onSubmit, onCancel }: {
+  initialAisleId: string; initialWidth: number; initialHeight: number; maxWidth: number;
   existingCodes: string[]; onSubmit: (values: RackCreationValues) => void; onCancel: () => void
 }) {
   const aisleId = initialAisleId;
   const [levelCount, setLevelCount] = useState(3);
-  const [levelHeights, setLevelHeights] = useState([240, 240, 240]);
+  const [levelHeights, setLevelHeights] = useState(() => makeRackLevelHeights(240, 3));
+  const [rackWidth, setRackWidth] = useState(initialWidth);
+  const [binsPerLevel, setBinsPerLevel] = useState(Math.min(4, maxRackBinsForWidth(initialWidth)));
   const [codeError, setCodeError] = useState('');
+  const [dimensionError, setDimensionError] = useState('');
   const [code, setCode] = useState(() => {
     let suffix = 1;
     let candidate = 'R-01';
@@ -1023,8 +1111,9 @@ function RackCreationForm({ initialAisleId, initialWidth, initialHeight, existin
 
   const changeLevelCount = (value: number) => {
     const count = Math.max(1, Math.min(12, value));
+    const totalHeight = calculateRackHeightCm(levelHeights);
     setLevelCount(count);
-    setLevelHeights((current) => Array.from({ length: count }, (_, index) => current[index] ?? 240));
+    setLevelHeights(makeRackLevelHeights(totalHeight, count));
   };
 
   return <form className="rack-wizard-form" onSubmit={(event) => {
@@ -1035,7 +1124,12 @@ function RackCreationForm({ initialAisleId, initialWidth, initialHeight, existin
       setCodeError('Ya existe una estantería con este código.');
       return;
     }
+    if (calculateRackHeightCm(levelHeights) > RACK_MAX_HEIGHT_CM) {
+      setDimensionError('La altura total no puede superar los 1200 cm (12 m).');
+      return;
+    }
     setCodeError('');
+    setDimensionError('');
     onSubmit({
       aisleId,
       name: String(form.get('name')).trim(),
@@ -1048,9 +1142,15 @@ function RackCreationForm({ initialAisleId, initialWidth, initialHeight, existin
   }}>
     <p className="rack-wizard-intro">Configura la estructura y el espacio útil. La estantería aparecerá en 3D al crearla.</p>
     <div className="form-row"><label>Nombre<input name="name" required minLength={2} maxLength={100} defaultValue="Estantería nueva" /></label><label>Código<input name="code" required pattern="[A-Za-z0-9-]{2,24}" value={code} onChange={(event) => { setCode(event.target.value.toUpperCase()); setCodeError(''); }} />{codeError && <small className="rack-form-error">{codeError}</small>}</label></div>
-    <div className="form-row"><label>Ancho (cm)<input name="width" type="number" min="220" max={initialWidth} step="10" defaultValue={initialWidth} required /></label><label>Fondo (cm)<input name="height" type="number" min="130" max={initialHeight} step="10" defaultValue={initialHeight} required /></label></div>
-    <div className="form-row"><label>Número de niveles<input type="number" min="1" max="12" value={levelCount} onChange={(event) => changeLevelCount(Number(event.target.value))} required /></label><label>Huecos por nivel<input name="binsPerLevel" type="number" min="1" max="12" defaultValue="4" required /></label></div>
-    <div className="rack-wizard-levels"><strong>Altura útil por nivel</strong><span>Personaliza cada balda en centímetros.</span>{levelHeights.map((height, index) => <label key={index}><span>Nivel {index + 1}</span><input type="number" min="1" max="1000" value={height} onChange={(event) => setLevelHeights((current) => current.map((item, position) => position === index ? Number(event.target.value) : item))} required /><small>cm</small></label>)}</div>
+    <div className="form-row"><label>Ancho (cm)<input name="width" type="number" min="220" max={maxWidth} step="10" value={rackWidth} onChange={(event) => {
+      const width = Number(event.target.value);
+      setRackWidth(width);
+      setBinsPerLevel((current) => Math.min(current, maxRackBinsForWidth(width)));
+    }} required /></label><label>Fondo (cm)<input name="height" type="number" min="130" max={initialHeight} step="10" defaultValue={initialHeight} required /></label></div>
+    <div className="form-row"><label>Número de niveles<input type="number" min="1" max="12" value={levelCount} onChange={(event) => changeLevelCount(Number(event.target.value))} required /></label><label>Huecos por nivel<input name="binsPerLevel" type="number" min="1" max={maxRackBinsForWidth(rackWidth)} value={binsPerLevel} onChange={(event) => setBinsPerLevel(Math.max(1, Math.min(maxRackBinsForWidth(rackWidth), Number(event.target.value))))} required /></label></div>
+    <label>Altura total (cm)<input type="number" min={Math.ceil(getMinimumRackHeightCm(levelCount))} max={getMaximumRackHeightCm(levelCount)} value={calculateRackHeightCm(levelHeights)} onChange={(event) => setLevelHeights(makeRackLevelHeights(Number(event.target.value), levelCount))} required /><small className="field-help">Altura máxima: 1200 cm (12 m). Los niveles se reparten dentro de esta altura.</small></label>
+    {dimensionError && <small className="rack-form-error">{dimensionError}</small>}
+    <div className="rack-wizard-levels"><strong>Separación vertical de cada nivel</strong><span>Se calcula desde la altura total; puedes ajustar cada balda.</span>{levelHeights.map((height, index) => <label key={index}><span>Nivel {index + 1}</span><input type="number" min={RACK_MIN_LEVEL_SPACING_CM} max="1000" value={height} onChange={(event) => setLevelHeights((current) => current.map((item, position) => position === index ? Number(event.target.value) : item))} required /><small>cm</small></label>)}</div>
     <div className="form-actions"><button type="button" className="button button-secondary" onClick={onCancel}>Cancelar</button><button className="button button-primary"><Layers size={15} /> Crear estantería 3D</button></div>
   </form>;
 }
@@ -1065,6 +1165,7 @@ function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin,
   onChange: (field: string, value: string | number) => void;
   onDelete: () => void; onSave: () => void; onDiscard: () => void
 }) {
+  const showExpectedContent = false; // Temporarily disabled; keep the comparison available to re-enable later.
   const [editingExpectedLocationId, setEditingExpectedLocationId] = useState<string | null>(null);
   const [qrLabelsOpen, setQrLabelsOpen] = useState(false);
   const [nameSaving, setNameSaving] = useState(false);
@@ -1095,7 +1196,7 @@ function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin,
           : currentBin ? <><div className="location-heading"><div><span className="eyebrow">CAJA</span><h2>{currentBin.display_name || currentBin.code}</h2><small>{currentBin.code}</small></div><span className="rack3d-unit-pill">{formatNumber(currentBin.quantity)} uds.</span></div><div className="rack3d-detail-content">
               <h3>Existencias reales</h3>{currentBin.products.filter((product) => number(product.quantity) > 0).map((product) => <div className="location-product" key={`${product.productId}-${product.lot}`}><span className="product-thumb thumb-0"><Package size={16} /></span><span><strong>{product.name}</strong><small>{product.sku}{product.lot ? ` · Lote ${product.lot}` : ''}</small></span><b>{formatNumber(product.quantity)} uds.</b></div>)}
               {!currentBin.products.some((product) => number(product.quantity) > 0) && <div className="location-empty">Este hueco está vacío.</div>}
-            </div><ExpectedContentsPanel location={currentBin} />
+            </div>{showExpectedContent && <ExpectedContentsPanel location={currentBin} />}
             {isAdmin && <form className="bin-name-editor" onSubmit={(event) => {
               event.preventDefault();
               setNameSaving(true);
@@ -1104,8 +1205,8 @@ function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin,
               <label>Nombre de la caja<input maxLength={100} value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder={currentBin.code} /></label>
               <button type="submit" className="button button-secondary full-button" disabled={nameSaving || displayName.trim() === (currentBin.display_name ?? '')}>{nameSaving ? 'Guardando…' : 'Guardar nombre de caja'}</button>
             </form>}
-            {isAdmin && <button className="button button-secondary full-button" onClick={() => setEditingExpectedLocationId(currentBin.id)}><Pencil size={14} /> Editar contenido esperado</button>}
-            {editingExpectedLocationId === currentBin.id && <ExpectedContentEditor key={currentBin.id} location={currentBin} products={products} onSave={onSaveExpected} onCancel={() => setEditingExpectedLocationId(null)} />}
+            {showExpectedContent && isAdmin && <button className="button button-secondary full-button" onClick={() => setEditingExpectedLocationId(currentBin.id)}><Pencil size={14} /> Editar contenido esperado</button>}
+            {showExpectedContent && editingExpectedLocationId === currentBin.id && <ExpectedContentEditor key={currentBin.id} location={currentBin} products={products} onSave={onSaveExpected} onCancel={() => setEditingExpectedLocationId(null)} />}
             <button className="button button-primary full-button" disabled={!currentBin.products.some((product) => number(product.quantity) > 0)} onClick={() => onMoveStock(currentBin)}><ArrowLeftRight size={15} /> Mover productos</button>
           </> : <div className="location-placeholder"><div className="placeholder-icon"><Package size={21} /></div><h3>Estantería completa</h3><p>Solo se muestran cajas ocupadas. Selecciona una caja para consultar su contenido.</p><span className="rack3d-unit-pill">{formatNumber(rack.units)} unidades en esta estantería</span></div>}
       </aside>
@@ -1528,7 +1629,8 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
       }
       if (field === 'level_count') {
         const count = Math.max(1, Math.min(12, Number(value)));
-        return { ...rack, level_count: count, level_heights: Array.from({ length: count }, (_, index) => number(rack.level_heights[index] ?? 240)) };
+        const totalHeight = calculateRackHeightCm(rack.level_heights.map(number));
+        return { ...rack, level_count: count, level_heights: makeRackLevelHeights(totalHeight, count) };
       }
       return { ...rack, [field]: value };
     }));
@@ -1540,7 +1642,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
       window.alert('No hay una zona de almacenamiento configurada para crear estanterías.');
       return;
     }
-    const width = Math.min(480, number(warehouseDraft.map_width), 1600);
+    const width = Math.min(480, number(warehouseDraft.map_width), 2000);
     const height = Math.min(280, number(warehouseDraft.map_height), 1200);
     const mapWidth = number(warehouseDraft.map_width);
     const mapHeight = number(warehouseDraft.map_height);
@@ -1768,7 +1870,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
               onResizeRack={(rackId, width, height) => {
                 const rack = activeRacks.find((item) => item.id === rackId);
                 if (!rack) return;
-                const nextWidth = Math.max(220, Math.min(1600, canvasWidth - number(rack.map_x), Math.round(width)));
+                const nextWidth = Math.max(220, Math.min(2000, canvasWidth - number(rack.map_x), Math.round(width)));
                 const nextHeight = Math.max(130, Math.min(1200, canvasHeight - number(rack.map_y), Math.round(height)));
                 if (!isRackWithinPerimeter({
                   x: number(rack.map_x), y: number(rack.map_y), width: nextWidth, height: nextHeight
@@ -1797,7 +1899,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
       </aside>
     </div>
     {rackWizard && <Modal title="Diseña tu estantería" onClose={() => setRackWizard(null)}>
-      <RackCreationForm initialAisleId={rackWizard.aisleId} initialWidth={Math.min(480, canvasWidth, 1600)} initialHeight={Math.min(280, canvasHeight, 1200)} existingCodes={rackDraft.map((rack) => rack.code)} onSubmit={createRackDraft} onCancel={() => setRackWizard(null)} />
+      <RackCreationForm initialAisleId={rackWizard.aisleId} initialWidth={Math.min(480, canvasWidth, 2000)} initialHeight={Math.min(280, canvasHeight, 1200)} maxWidth={Math.min(2000, canvasWidth)} existingCodes={rackDraft.map((rack) => rack.code)} onSubmit={createRackDraft} onCancel={() => setRackWizard(null)} />
     </Modal>}
   </>;
 }
@@ -2084,7 +2186,7 @@ function MovementForm({ products, locations, racks, warehouses, currentWarehouse
         {toBinId && selectedDestination && isEmpty(selectedDestination) && <>
           <label>Nombre de la caja (opcional)<input name="binName" maxLength={100} placeholder="Ej. Caja azul · tornillería M8" /><small className="field-help">Se guardará en esta ubicación y aparecerá en el visor 3D.</small></label>
           <label>Tamaño de la caja<select name="binWidthUnits" defaultValue={selectedDestination.width_units}>
-            {Array.from({ length: Math.min(4, (destinationRacks.find((rack) => rack.id === selectedDestination.rack_id)?.bins_per_level ?? 1) - selectedDestination.slot_position + 1) }, (_value, index) => index + 1).map((units) => <option key={units} value={units}>{units} {units === 1 ? 'hueco' : 'huecos'} seguidos</option>)}
+            {Array.from({ length: Math.min(12, (destinationRacks.find((rack) => rack.id === selectedDestination.rack_id)?.bins_per_level ?? 1) - selectedDestination.slot_position + 1) }, (_value, index) => index + 1).map((units) => <option key={units} value={units}>{units} {units === 1 ? 'hueco' : 'huecos'} seguidos</option>)}
           </select><small className="field-help">Se crea ocupando huecos contiguos a la derecha en la misma balda. Solo se puede hacer con huecos vacíos.</small></label>
         </>}
       {choosesExistingLot

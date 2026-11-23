@@ -19,6 +19,9 @@ BEGIN
     INSERT INTO employee_movement_alerts (movement_id)
     VALUES (NEW.id)
     ON CONFLICT (movement_id) DO NOTHING;
+    IF FOUND THEN
+      PERFORM pg_notify('employee_movement_alerts', NEW.id::text);
+    END IF;
   END IF;
   RETURN NEW;
 END;
