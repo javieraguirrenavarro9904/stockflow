@@ -1,0 +1,1 @@
+ALTER TABLE bins ADD COLUMN IF NOT EXISTS display_name TEXT;

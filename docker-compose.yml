@@ -1,0 +1,37 @@
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: wms
+      POSTGRES_USER: wms
+      POSTGRES_PASSWORD: wms
+    ports:
+      - "5432:5432"
+    volumes:
+      - wms-data:/var/lib/postgresql/data
+      - ./apps/api/src/db/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+      - ./apps/api/src/db/migrations/001-sessions-and-racks.sql:/docker-entrypoint-initdb.d/002-migration.sql:ro
+      - ./apps/api/src/db/migrations/003-warehouse-perimeter-and-centimeters.sql:/docker-entrypoint-initdb.d/003-warehouse-perimeter-and-centimeters.sql:ro
+      - ./apps/api/src/db/migrations/004-purchasing-and-orders.sql:/docker-entrypoint-initdb.d/004-purchasing-and-orders.sql:ro
+      - ./apps/api/src/db/migrations/005-bin-display-name.sql:/docker-entrypoint-initdb.d/005-bin-display-name.sql:ro
+      - ./apps/api/src/db/migrations/006-bin-expectations.sql:/docker-entrypoint-initdb.d/006-bin-expectations.sql:ro
+      - ./apps/api/src/db/migrations/007-wide-bins.sql:/docker-entrypoint-initdb.d/007-wide-bins.sql:ro
+      - ./apps/api/src/db/seed.sql:/docker-entrypoint-initdb.d/008-seed.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wms -d wms"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  adminer:
+    image: adminer:latest
+    container_name: wms_adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  wms-data:

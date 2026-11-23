@@ -1,0 +1,16 @@
+{
+  "name": "wms-warehouse",
+  "private": true,
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev": "concurrently -k -n API,WEB -c blue,green \"npm run dev -w @wms/api\" \"npm run dev -w @wms/web\"",
+    "build": "npm run build -w @wms/api && npm run build -w @wms/web",
+    "typecheck": "npm run typecheck -w @wms/api && npm run typecheck -w @wms/web"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.2"
+  }
+}
