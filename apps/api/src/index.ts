@@ -443,6 +443,78 @@ app.get('/api/catalog-options', async (_req, res, next) => {
   }
 });
 
+const catalogEntrySchema = z.object({
+  name: z.string().trim().min(2).max(120)
+});
+
+app.post('/api/categories', requireAdmin, async (req, res, next) => {
+  const parsed = catalogEntrySchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Nombre de categoría no válido' });
+  try {
+    const result = await pool.query(
+      'INSERT INTO categories (name) VALUES ($1) RETURNING id, name',
+      [parsed.data.name]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/categories/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const category = await client.query('SELECT id FROM categories WHERE id = $1 FOR UPDATE', [req.params.id]);
+    if (!category.rowCount) throw Object.assign(new Error('Categoría no encontrada'), { status: 404 });
+    await client.query('UPDATE products SET category_id = NULL WHERE category_id = $1', [req.params.id]);
+    await client.query('UPDATE categories SET parent_id = NULL WHERE parent_id = $1', [req.params.id]);
+    await client.query('DELETE FROM categories WHERE id = $1', [req.params.id]);
+    await client.query('COMMIT');
+    res.json({ deleted: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/suppliers', requireAdmin, async (req, res, next) => {
+  const parsed = catalogEntrySchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Nombre de proveedor no válido' });
+  try {
+    const result = await pool.query(
+      'INSERT INTO suppliers (name) VALUES ($1) RETURNING id, name',
+      [parsed.data.name]
+    );
+    res.status(201).json(result.rows[0]);
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.delete('/api/suppliers/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, next) => {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const supplier = await client.query('SELECT id FROM suppliers WHERE id = $1 FOR UPDATE', [req.params.id]);
+    if (!supplier.rowCount) throw Object.assign(new Error('Proveedor no encontrado'), { status: 404 });
+    const purchaseOrders = await client.query('SELECT id FROM purchase_orders WHERE supplier_id = $1 LIMIT 1', [req.params.id]);
+    if (purchaseOrders.rowCount)
+      throw Object.assign(new Error('No se puede eliminar: el proveedor tiene pedidos de compra en el historial'), { status: 409 });
+    await client.query('UPDATE products SET supplier_id = NULL WHERE supplier_id = $1', [req.params.id]);
+    await client.query('DELETE FROM suppliers WHERE id = $1', [req.params.id]);
+    await client.query('COMMIT');
+    res.json({ deleted: true });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
 const productSchema = z.object({
   sku: z.string().trim().min(2).max(64),
   name: z.string().trim().min(2).max(160),

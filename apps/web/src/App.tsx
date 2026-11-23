@@ -585,6 +585,35 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
     }
   };
 
+  const createCatalogEntry = async (kind: 'categories' | 'suppliers', name: string): Promise<boolean> => {
+    try {
+      await request(`/${kind}`, { method: 'POST', body: JSON.stringify({ name }) });
+      await refresh();
+      notify(kind === 'categories' ? 'Categoría añadida' : 'Proveedor añadido');
+      return true;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'No se pudo guardar');
+      return false;
+    }
+  };
+
+  const deleteCatalogEntry = async (kind: 'categories' | 'suppliers', entry: CatalogOption): Promise<boolean> => {
+    const label = kind === 'categories' ? 'categoría' : 'proveedor';
+    const consequence = kind === 'categories'
+      ? 'Los productos asociados quedarán sin categoría.'
+      : 'Los productos asociados quedarán sin proveedor. No se pueden eliminar proveedores con pedidos de compra en el historial.';
+    if (!window.confirm(`¿Eliminar ${label} «${entry.name}»? ${consequence}`)) return false;
+    try {
+      await request(`/${kind}/${entry.id}`, { method: 'DELETE' });
+      await refresh();
+      notify(kind === 'categories' ? 'Categoría eliminada' : 'Proveedor eliminado');
+      return true;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : `No se pudo eliminar ${label}`);
+      return false;
+    }
+  };
+
   const pageTitle = page === 'settings' ? 'Configuración' : navItems.find((item) => item.id === page)?.label ?? 'Resumen';
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
@@ -657,7 +686,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
           {page === 'purchasing' && <PurchasingPage suggestions={replenishment} orders={purchaseOrders} locations={locations} isAdmin={isAdmin} onCreateOrder={createPurchaseOrders} onReceiveOrder={receivePurchaseOrder} onCancelOrder={cancelPurchaseOrder} />}
           {page === 'salesOrders' && <SalesOrdersPage orders={salesOrders} products={products} locations={locations} onCreateOrder={createSalesOrder} onStartPicking={(id) => changeSalesOrder(id, 'picking')} onFulfill={(id) => changeSalesOrder(id, 'fulfill')} onCancelOrder={(id) => changeSalesOrder(id, 'cancel')} />}
           {page === 'assistant' && <AssistantPage />}
-          {page === 'settings' && <SettingsPage user={user} users={users} isAdmin={isAdmin} onAddUser={() => setModal('employee')} onToggleUser={(entry) => void toggleEmployee(entry)} onChangePassword={changePassword} />}
+          {page === 'settings' && <SettingsPage user={user} users={users} categories={categories} suppliers={suppliers} isAdmin={isAdmin} onAddUser={() => setModal('employee')} onToggleUser={(entry) => void toggleEmployee(entry)} onChangePassword={changePassword} onCreateCatalogEntry={createCatalogEntry} onDeleteCatalogEntry={deleteCatalogEntry} />}
         </div>
       </main>
       {modal && <Modal wide={modal === 'movement'} error={modal === 'movement' ? movementError : ''} title={modal === 'product' ? 'Añadir producto' : modal === 'editProduct' ? 'Editar producto' : modal === 'employee' ? 'Crear cuenta de empleado' : modal === 'warehouse' ? 'Añadir almacén' : 'Registrar movimiento'} onClose={() => { setModal(null); setEditingProduct(null); setMovementDefaults(null); setMovementError(''); }}>
@@ -706,9 +735,11 @@ function LoginPage({ onLogin }: { onLogin: (email: string, password: string) => 
   </section></main>;
 }
 
-function SettingsPage({ user, users, isAdmin, onAddUser, onToggleUser, onChangePassword }: {
-  user: AuthUser; users: UserEntry[]; isAdmin: boolean; onAddUser: () => void;
-  onToggleUser: (user: UserEntry) => void; onChangePassword: (event: FormEvent<HTMLFormElement>) => void
+function SettingsPage({ user, users, categories, suppliers, isAdmin, onAddUser, onToggleUser, onChangePassword, onCreateCatalogEntry, onDeleteCatalogEntry }: {
+  user: AuthUser; users: UserEntry[]; categories: CatalogOption[]; suppliers: CatalogOption[]; isAdmin: boolean; onAddUser: () => void;
+  onToggleUser: (user: UserEntry) => void; onChangePassword: (event: FormEvent<HTMLFormElement>) => void;
+  onCreateCatalogEntry: (kind: 'categories' | 'suppliers', name: string) => Promise<boolean>;
+  onDeleteCatalogEntry: (kind: 'categories' | 'suppliers', entry: CatalogOption) => Promise<boolean>;
 }) {
   return <>
     <PageIntro eyebrow="CUENTA Y PERMISOS" title="Configuración" description="Gestiona tu sesión y los accesos del equipo al almacén." />
@@ -726,9 +757,65 @@ function SettingsPage({ user, users, isAdmin, onAddUser, onToggleUser, onChangeP
           {!users.length && <div className="table-empty">Cargando usuarios…</div>}</div>
         <div className="team-footnote"><ShieldCheck size={14} /> Desactivar una cuenta cierra también las sesiones abiertas.</div>
       </section>}
+      {isAdmin && <CatalogManagement categories={categories} suppliers={suppliers} onCreate={onCreateCatalogEntry} onDelete={onDeleteCatalogEntry} />}
       {!isAdmin && <section className="panel employee-permissions"><div className="settings-section-title"><Users size={16} /><strong>Permisos del empleado</strong></div><p>Puedes consultar el inventario, registrar movimientos, explorar el mapa y utilizar el asistente. La configuración de productos y estanterías está reservada a administradores.</p></section>}
     </div>
   </>;
+}
+
+function CatalogManagement({ categories, suppliers, onCreate, onDelete }: {
+  categories: CatalogOption[]; suppliers: CatalogOption[];
+  onCreate: (kind: 'categories' | 'suppliers', name: string) => Promise<boolean>;
+  onDelete: (kind: 'categories' | 'suppliers', entry: CatalogOption) => Promise<boolean>;
+}) {
+  const [categoryName, setCategoryName] = useState('');
+  const [supplierName, setSupplierName] = useState('');
+  const [saving, setSaving] = useState<'categories' | 'suppliers' | ''>('');
+  const [deleting, setDeleting] = useState('');
+
+  const submit = async (event: FormEvent<HTMLFormElement>, kind: 'categories' | 'suppliers', name: string) => {
+    event.preventDefault();
+    setSaving(kind);
+    try {
+      if (await onCreate(kind, name.trim())) {
+        if (kind === 'categories') setCategoryName('');
+        else setSupplierName('');
+      }
+    } finally {
+      setSaving('');
+    }
+  };
+
+  const remove = async (kind: 'categories' | 'suppliers', entry: CatalogOption) => {
+    setDeleting(entry.id);
+    try {
+      await onDelete(kind, entry);
+    } finally {
+      setDeleting('');
+    }
+  };
+
+  return <section className="panel catalog-management">
+    <div className="panel-heading"><div><h2>Categorías y proveedores</h2><p>Administra las opciones disponibles al crear o editar productos.</p></div></div>
+    <div className="catalog-management-columns">
+      {([
+        { kind: 'categories' as const, title: 'Categorías', items: categories, name: categoryName, setName: setCategoryName },
+        { kind: 'suppliers' as const, title: 'Proveedores', items: suppliers, name: supplierName, setName: setSupplierName }
+      ]).map(({ kind, title, items, name, setName }) => <div className="catalog-management-group" key={kind}>
+        <h3>{title}<span>{items.length}</span></h3>
+        <form className="catalog-add-form" onSubmit={(event) => void submit(event, kind, name)}>
+          <input required minLength={2} maxLength={120} value={name} onChange={(event) => setName(event.target.value)} placeholder={`Nueva ${kind === 'categories' ? 'categoría' : 'proveedor'}`} aria-label={`Nombre de ${kind === 'categories' ? 'categoría' : 'proveedor'}`} />
+          <button type="submit" className="button button-primary" disabled={saving === kind || name.trim().length < 2}>{saving === kind ? 'Guardando…' : <><Plus size={14} /> Añadir</>}</button>
+        </form>
+        <div className="catalog-entry-list">{items.map((entry) => <div className="catalog-entry" key={entry.id}>
+          <span>{entry.name}</span>
+          <button type="button" className="button button-secondary catalog-delete" disabled={deleting === entry.id} onClick={() => void remove(kind, entry)}>{deleting === entry.id ? '…' : 'Eliminar'}</button>
+        </div>)}
+          {!items.length && <p className="catalog-empty">Todavía no hay {kind === 'categories' ? 'categorías' : 'proveedores'}.</p>}
+        </div>
+      </div>)}
+    </div>
+  </section>;
 }
 
 function EmployeeForm({ onSubmit, onCancel }: { onSubmit: (event: FormEvent<HTMLFormElement>) => void; onCancel: () => void }) {

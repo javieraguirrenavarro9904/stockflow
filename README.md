@@ -129,6 +129,8 @@ El modelo de datos relaciona almacén, zona, pasillo, estantería, nivel y ubica
 
 El catálogo se relaciona con categorías y proveedores. El stock se mantiene por producto, lote y ubicación; los lotes pueden llevar fecha de caducidad. `movements` y `movement_lines` forman el Kardex.
 
+El administrador puede añadir o eliminar categorías y proveedores desde **Configuración → Categorías y proveedores**. Al borrar una categoría, los productos asociados quedan sin categoría; al borrar un proveedor, sus productos quedan sin proveedor. No se permite eliminar proveedores con pedidos de compra en el historial, para conservar la trazabilidad.
+
 El alta de movimientos se valida en el servidor. La API bloquea los saldos afectados con `SELECT … FOR UPDATE`, selecciona lotes FIFO, comprueba el stock libre y registra cantidades y auditoría en una transacción PostgreSQL. Los movimientos contabilizados son inmutables: cualquier corrección debe ser un nuevo movimiento.
 
 Las sesiones usan tokens aleatorios de corta duración (8 horas); la base conserva solo el SHA-256 del token. Las contraseñas se verifican con `scrypt`, hay limitación de intentos de inicio de sesión y cierre/revocación de sesiones. El administrador puede crear/desactivar empleados, gestionar el catálogo y modificar el plano, además de crear y cancelar pedidos a proveedores. El equipo puede consultar el almacén, usar el asistente, registrar movimientos, crear/preparar pedidos de salida y recibir pedidos a proveedores. Los roles también se verifican en la API, no solo en la interfaz.
@@ -139,6 +141,7 @@ Las sesiones usan tokens aleatorios de corta duración (8 horas); la base conser
 - `POST /api/auth/login`, `GET /api/auth/me`, `POST /api/auth/logout`, `PATCH /api/auth/password`
 - `GET /api/users`, `POST /api/users`, `PATCH /api/users/:id/active` (administrador)
 - `GET /api/products?search=...`, `POST /api/products`, `PATCH /api/products/:id`, `DELETE /api/products/:id`
+- `GET /api/catalog-options`, `POST /api/categories`, `DELETE /api/categories/:id`, `POST /api/suppliers`, `DELETE /api/suppliers/:id` (administrador)
 - `GET /api/map-layout`, `PUT /api/map-layout` (administrador; guarda el plano completo en una transacción SQL)
 - `GET /api/locations`, `PUT /api/locations/:id/expected-content`, `PUT /api/locations/:id/width` y `PATCH /api/locations/:id/display-name` (administrador), `GET /api/racks?warehouseId=...`, `POST /api/racks`, `PATCH /api/racks/:id`, `PATCH /api/racks/map`
 - `GET /api/movements`, `POST /api/movements`
