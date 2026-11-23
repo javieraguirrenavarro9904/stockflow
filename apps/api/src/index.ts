@@ -726,7 +726,7 @@ app.get('/api/map-layout', async (_req, res, next) => {
   try {
     const warehouseId = res.locals.warehouseId as string;
     const warehouse = await pool.query(`
-      SELECT id, name, code, map_width, map_height, map_perimeter FROM warehouses WHERE id = $1
+      SELECT id, name, code, map_width, map_height, map_perimeter, map_structures FROM warehouses WHERE id = $1
     `, [warehouseId]);
     if (!warehouse.rowCount) return res.status(404).json({ error: 'No hay un almacén configurado' });
     const [zones, aisles] = await Promise.all([
@@ -749,6 +749,23 @@ app.get('/api/map-layout', async (_req, res, next) => {
 
 type MapPoint = { x: number; y: number };
 type RackBounds = { x: number; y: number; width: number; height: number };
+type WarehouseStructure = {
+  id: string;
+  type: 'wall' | 'door';
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+function isRackOverlappingStructure(rack: RackBounds, structure: WarehouseStructure) {
+  return rack.x < structure.x + structure.width && rack.x + rack.width > structure.x &&
+    rack.y < structure.y + structure.height && rack.y + rack.height > structure.y;
+}
+
+function rackOverlapsStructures(rack: RackBounds, structures: WarehouseStructure[]) {
+  return structures.some((structure) => isRackOverlappingStructure(rack, structure));
+}
 
 function isRackWithinPerimeter(rack: RackBounds, perimeter: MapPoint[]): boolean {
   if (perimeter.length < 3) return true;
@@ -859,6 +876,10 @@ function maxRackBinsForWidth(widthCm: number) {
   return Math.max(1, Math.min(12, Math.floor((widthCm - 44) / 38)));
 }
 
+function maxRackDepthSlots(levelCount: number, binsPerLevel: number, depthCm: number) {
+  return Math.max(1, Math.min(12, Math.floor(depthCm * 0.72 / 20), Math.floor(100 / (levelCount * binsPerLevel))));
+}
+
 function rackBinModuleWidth(widthCm: number, binsPerLevel: number) {
   return Math.max(5, Math.floor((widthCm - 44) / binsPerLevel) - 6);
 }
@@ -874,6 +895,7 @@ const rackLayoutSchema = z.object({
   map_width: z.coerce.number().min(160).max(2000),
   map_height: z.coerce.number().min(130).max(1200),
   binsPerLevel: z.coerce.number().int().min(1).max(12),
+  depthSlots: z.coerce.number().int().min(1).max(12).default(1),
   levelHeights: z.array(z.coerce.number().min(minRackLevelSpacingCm).max(1000)).min(1).max(12)
 }).superRefine((rack, ctx) => {
   if (!rack.id && rack.map_width < 220)
@@ -891,6 +913,19 @@ const mapLayoutSchema = z.object({
     x: z.coerce.number().min(0).max(30000),
     y: z.coerce.number().min(0).max(30000)
   })).max(500).optional(),
+  structures: z.array(z.object({
+    id: z.string().min(1).max(80),
+    type: z.enum(['wall', 'door']),
+    x: z.coerce.number().min(0).max(30000),
+    y: z.coerce.number().min(0).max(30000),
+    width: z.coerce.number().min(20).max(30000),
+    height: z.coerce.number().min(20).max(30000)
+  }).superRefine((structure, ctx) => {
+    const horizontal = structure.height === 20 && structure.width >= 100;
+    const vertical = structure.width === 20 && structure.height >= 100;
+    if (!horizontal && !vertical)
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Las paredes y puertas deben ser segmentos horizontales o verticales de al menos 1 m' });
+  })).max(500).default([]),
   aisles: z.array(z.object({
     id: z.string().uuid().optional(),
     clientId: z.string().min(1).max(80).optional(),
@@ -919,8 +954,14 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
   const aisleClientIds = new Set(layout.aisles.flatMap((aisle) => aisle.clientId ? [aisle.clientId] : []));
   if (aisleClientIds.size !== layout.aisles.filter((aisle) => aisle.clientId).length)
     return res.status(400).json({ error: 'Hay identificadores de pasillo duplicados' });
-  if (layout.racks.some((rack) => rack.levelHeights.length * rack.binsPerLevel > 100))
+  const structureIds = new Set(layout.structures.map((structure) => structure.id));
+  if (structureIds.size !== layout.structures.length)
+    return res.status(400).json({ error: 'Hay identificadores de pared o puerta duplicados' });
+  if (layout.racks.some((rack) => rack.levelHeights.length * rack.binsPerLevel * rack.depthSlots > 100))
     return res.status(400).json({ error: 'Una estantería no puede superar 100 ubicaciones' });
+  if (layout.racks.some((rack) =>
+    rack.depthSlots > maxRackDepthSlots(rack.levelHeights.length, rack.binsPerLevel, rack.map_height)
+  )) return res.status(400).json({ error: 'Aumenta el fondo de la estantería para añadir más filas de ubicaciones' });
   if (layout.racks.some((rack) => rack.map_height < 48 + rack.levelHeights.length * 22))
     return res.status(400).json({ error: 'Aumenta la altura de la estantería para que quepan todos los niveles' });
 
@@ -934,6 +975,15 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
     if (!isValidPerimeter(perimeter) || perimeter.some((point) =>
       point.x > layout.warehouse.map_width || point.y > layout.warehouse.map_height
     )) throw Object.assign(new Error('El perímetro debe formar un polígono válido dentro del almacén'), { status: 400 });
+    if (layout.structures.some((structure) =>
+      structure.x + structure.width > layout.warehouse.map_width ||
+      structure.y + structure.height > layout.warehouse.map_height ||
+      !isRackWithinPerimeter(structure, perimeter)
+    )) throw Object.assign(new Error('Las paredes y puertas deben quedar dentro del perímetro y las dimensiones del almacén'), { status: 400 });
+    if (layout.racks.some((rack) => rackOverlapsStructures({
+      x: rack.map_x, y: rack.map_y, width: rack.map_width, height: rack.map_height
+    }, layout.structures)))
+      throw Object.assign(new Error('No se puede colocar una estantería sobre una pared o puerta'), { status: 409 });
     if (layout.deleteRackIds.length) {
       const deletableScope = await client.query(`
         SELECT count(*)::int AS count FROM racks r
@@ -965,8 +1015,8 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
       await client.query('DELETE FROM racks WHERE id = ANY($1::uuid[])', [layout.deleteRackIds]);
     }
     await client.query(
-      'UPDATE warehouses SET map_width = $1, map_height = $2, map_perimeter = $3::jsonb WHERE id = $4',
-      [layout.warehouse.map_width, layout.warehouse.map_height, JSON.stringify(perimeter), warehouseId]
+      'UPDATE warehouses SET map_width = $1, map_height = $2, map_perimeter = $3::jsonb, map_structures = $4::jsonb WHERE id = $5',
+      [layout.warehouse.map_width, layout.warehouse.map_height, JSON.stringify(perimeter), JSON.stringify(layout.structures), warehouseId]
     );
 
     const aisleIds = new Map<string, string>();
@@ -1008,25 +1058,28 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
       let rackId: string;
       if (rack.id) {
         const current = await client.query(`
-          SELECT r.id,
+          SELECT r.id, r.depth_slots,
                  (SELECT count(*)::int FROM rack_levels WHERE rack_id = r.id) AS level_count,
                  COALESCE((SELECT max(bin_count) FROM (
                    SELECT count(*)::int AS bin_count FROM rack_levels rl
-                   JOIN bins b ON b.rack_level_id = rl.id WHERE rl.rack_id = r.id GROUP BY rl.id
+                   JOIN bins b ON b.rack_level_id = rl.id WHERE rl.rack_id = r.id
+                   GROUP BY rl.id, b.depth_position
                  ) levels), 0)::int AS bins_per_level
           FROM racks r JOIN aisles a ON a.id = r.aisle_id JOIN zones z ON z.id = a.zone_id
           WHERE r.id = $1 AND z.warehouse_id = $2 FOR UPDATE OF r
         `, [rack.id, warehouseId]);
         if (!current.rowCount) throw Object.assign(new Error('No se encontró una estantería del plano'), { status: 404 });
-        const previous = current.rows[0] as { id: string; level_count: number; bins_per_level: number };
-        if (rack.levelHeights.length < previous.level_count || rack.binsPerLevel < previous.bins_per_level)
+        const previous = current.rows[0] as { id: string; depth_slots: number; level_count: number; bins_per_level: number };
+        if (rack.levelHeights.length < previous.level_count ||
+            rack.binsPerLevel < previous.bins_per_level ||
+            rack.depthSlots < previous.depth_slots)
           throw Object.assign(new Error(`No se pueden eliminar niveles o ubicaciones existentes de ${rack.code}`), { status: 409 });
         if (rack.binsPerLevel > previous.bins_per_level && rack.binsPerLevel > maxRackBinsForWidth(rack.map_width))
           throw Object.assign(new Error(`El ancho de ${rack.code} no permite añadir tantos huecos por nivel`), { status: 400 });
         await client.query(
-          `UPDATE racks SET aisle_id = $1, name = $2, code = $3, map_x = $4, map_y = $5, map_width = $6, map_height = $7
-           WHERE id = $8`,
-          [aisleId, rack.name, rack.code, rack.map_x, rack.map_y, rack.map_width, rack.map_height, rack.id]
+          `UPDATE racks SET aisle_id = $1, name = $2, code = $3, map_x = $4, map_y = $5, map_width = $6, map_height = $7, depth_slots = $8
+           WHERE id = $9`,
+          [aisleId, rack.name, rack.code, rack.map_x, rack.map_y, rack.map_width, rack.map_height, rack.depthSlots, rack.id]
         );
         rackId = rack.id;
         const levels = await client.query('SELECT id, level_number FROM rack_levels WHERE rack_id = $1 ORDER BY level_number', [rackId]);
@@ -1034,25 +1087,35 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
         const binHeight = Math.max(20, Math.floor((rack.map_height - 56) / rack.levelHeights.length) - 8);
         for (const level of levels.rows as { id: string; level_number: number }[]) {
           await client.query('UPDATE rack_levels SET height_cm = $1 WHERE id = $2', [rack.levelHeights[level.level_number - 1], level.id]);
-          const bins = await client.query('SELECT id, width_units FROM bins WHERE rack_level_id = $1 ORDER BY code', [level.id]);
-          for (let index = 0; index < bins.rows.length; index += 1) {
-            const { code, barcode } = makeLocationCode(codePrefix, rack.code, level.level_number, index + 1);
+          const bins = await client.query(`
+            SELECT id, width_units, depth_position, substring(code from '-([0-9]+)$')::int AS slot_position
+            FROM bins WHERE rack_level_id = $1 ORDER BY depth_position, slot_position
+          `, [level.id]);
+          const existingPositions = new Set<string>();
+          for (const bin of bins.rows as { id: string; width_units: number; depth_position: number; slot_position: number }[]) {
+            const depthPosition = Number(bin.depth_position);
+            const slotPosition = Number(bin.slot_position);
+            existingPositions.add(`${depthPosition}:${slotPosition}`);
+            const { code, barcode } = makeLocationCode(codePrefix, rack.code, level.level_number, slotPosition, depthPosition);
             await client.query(
               `UPDATE bins SET code = $1, barcode = $2, map_x = $3, map_y = $4, map_width = $5, map_height = $6 WHERE id = $7`,
-              [code, barcode, rack.map_x + 22 + index * (binWidth + 6),
+              [code, barcode, rack.map_x + 22 + (slotPosition - 1) * (binWidth + 6),
                 rack.map_y + 38 + (level.level_number - 1) * (binHeight + 8),
-                binWidth * Number(bins.rows[index].width_units) + 6 * (Number(bins.rows[index].width_units) - 1),
-                binHeight, bins.rows[index].id]
+                binWidth * Number(bin.width_units) + 6 * (Number(bin.width_units) - 1),
+                binHeight, bin.id]
             );
           }
-          for (let position = bins.rows.length + 1; position <= rack.binsPerLevel; position += 1) {
-            const { code, barcode } = makeLocationCode(codePrefix, rack.code, level.level_number, position);
-            await client.query(
-              `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-              [level.id, code, barcode, rack.map_x + 22 + (position - 1) * (binWidth + 6),
-                rack.map_y + 38 + (level.level_number - 1) * (binHeight + 8), binWidth, binHeight]
-            );
+          for (let depthPosition = 1; depthPosition <= rack.depthSlots; depthPosition += 1) {
+            for (let position = 1; position <= rack.binsPerLevel; position += 1) {
+              if (existingPositions.has(`${depthPosition}:${position}`)) continue;
+              const { code, barcode } = makeLocationCode(codePrefix, rack.code, level.level_number, position, depthPosition);
+              await client.query(
+                `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height, depth_position)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                [level.id, code, barcode, rack.map_x + 22 + (position - 1) * (binWidth + 6),
+                  rack.map_y + 38 + (level.level_number - 1) * (binHeight + 8), binWidth, binHeight, depthPosition]
+              );
+            }
           }
         }
         for (let levelNumber = previous.level_count + 1; levelNumber <= rack.levelHeights.length; levelNumber += 1) {
@@ -1060,23 +1123,27 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
             'INSERT INTO rack_levels (rack_id, level_number, height_cm) VALUES ($1, $2, $3) RETURNING id',
             [rackId, levelNumber, rack.levelHeights[levelNumber - 1]]
           );
-          for (let position = 1; position <= rack.binsPerLevel; position += 1) {
-            const { code, barcode } = makeLocationCode(codePrefix, rack.code, levelNumber, position);
-            await client.query(
-              `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-              [inserted.rows[0].id, code, barcode, rack.map_x + 22 + (position - 1) * (binWidth + 6),
-                rack.map_y + 38 + (levelNumber - 1) * (binHeight + 8), binWidth, binHeight]
-            );
+          for (let depthPosition = 1; depthPosition <= rack.depthSlots; depthPosition += 1) {
+            for (let position = 1; position <= rack.binsPerLevel; position += 1) {
+              const { code, barcode } = makeLocationCode(codePrefix, rack.code, levelNumber, position, depthPosition);
+              await client.query(
+                `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height, depth_position)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                [inserted.rows[0].id, code, barcode, rack.map_x + 22 + (position - 1) * (binWidth + 6),
+                  rack.map_y + 38 + (levelNumber - 1) * (binHeight + 8), binWidth, binHeight, depthPosition]
+              );
+            }
           }
         }
       } else {
         if (rack.binsPerLevel > maxRackBinsForWidth(rack.map_width))
           throw Object.assign(new Error(`El ancho de ${rack.code} no permite tantos huecos por nivel`), { status: 400 });
+        if (rack.depthSlots > maxRackDepthSlots(rack.levelHeights.length, rack.binsPerLevel, rack.map_height))
+          throw Object.assign(new Error(`La capacidad máxima de ${rack.code} es de 100 ubicaciones`), { status: 400 });
         const inserted = await client.query(
-          `INSERT INTO racks (aisle_id, name, code, map_x, map_y, map_width, map_height)
-           VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-          [aisleId, rack.name, rack.code, rack.map_x, rack.map_y, rack.map_width, rack.map_height]
+          `INSERT INTO racks (aisle_id, name, code, map_x, map_y, map_width, map_height, depth_slots)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+          [aisleId, rack.name, rack.code, rack.map_x, rack.map_y, rack.map_width, rack.map_height, rack.depthSlots]
         );
         rackId = inserted.rows[0].id as string;
         const binWidth = rackBinModuleWidth(rack.map_width, rack.binsPerLevel);
@@ -1086,14 +1153,16 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
             'INSERT INTO rack_levels (rack_id, level_number, height_cm) VALUES ($1, $2, $3) RETURNING id',
             [rackId, levelNumber, rack.levelHeights[levelNumber - 1]]
           );
-          for (let position = 1; position <= rack.binsPerLevel; position += 1) {
-            const { code, barcode } = makeLocationCode(codePrefix, rack.code, levelNumber, position);
-            await client.query(
-              `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height)
-               VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-              [level.rows[0].id, code, barcode, rack.map_x + 22 + (position - 1) * (binWidth + 6),
-                rack.map_y + 38 + (levelNumber - 1) * (binHeight + 8), binWidth, binHeight]
-            );
+          for (let depthPosition = 1; depthPosition <= rack.depthSlots; depthPosition += 1) {
+            for (let position = 1; position <= rack.binsPerLevel; position += 1) {
+              const { code, barcode } = makeLocationCode(codePrefix, rack.code, levelNumber, position, depthPosition);
+              await client.query(
+                `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height, depth_position)
+                 VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+                [level.rows[0].id, code, barcode, rack.map_x + 22 + (position - 1) * (binWidth + 6),
+                  rack.map_y + 38 + (levelNumber - 1) * (binHeight + 8), binWidth, binHeight, depthPosition]
+              );
+            }
           }
         }
       }
@@ -1153,7 +1222,7 @@ app.get('/api/locations', async (req, res, next) => {
     const warehouseId = requestedWarehouse.success ? requestedWarehouse.data : res.locals.warehouseId as string;
     const result = await pool.query(`
       SELECT b.id, b.code, b.barcode, b.capacity, b.display_name, b.map_x, b.map_y, b.map_width, b.map_height,
-             b.width_units, substring(b.code from '-([0-9]+)$')::int AS slot_position, b.status,
+             b.width_units, b.depth_position, substring(b.code from '-([0-9]+)$')::int AS slot_position, b.status,
              z.warehouse_id, w.name AS warehouse,
              z.name AS zone, a.id AS aisle_id, a.code AS aisle, r.id AS rack_id, r.code AS rack, rl.level_number,
              COALESCE(sum(sb.quantity), 0)::numeric AS quantity,
@@ -1257,8 +1326,10 @@ async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: st
   const selected = await client.query(`
       SELECT b.id, b.rack_level_id, b.width_units, b.merged_into_bin_id, b.status,
              r.map_width AS rack_map_width,
-             (SELECT count(*)::int FROM bins level_bins WHERE level_bins.rack_level_id = b.rack_level_id) AS slots_per_level,
-             substring(b.code from '-([0-9]+)$')::int AS slot_position
+             (SELECT count(*)::int FROM bins level_bins
+              WHERE level_bins.rack_level_id = b.rack_level_id
+                AND level_bins.depth_position = b.depth_position) AS slots_per_level,
+             b.depth_position, substring(b.code from '-([0-9]+)$')::int AS slot_position
       FROM bins b
       JOIN rack_levels rl ON rl.id = b.rack_level_id
       JOIN racks r ON r.id = rl.rack_id
@@ -1271,7 +1342,7 @@ async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: st
     throw Object.assign(new Error('La ubicación no pertenece al almacén activo'), { status: 404 });
   const anchor = selected.rows[0] as {
       id: string; rack_level_id: string; width_units: number; merged_into_bin_id: string | null;
-      status: string; slot_position: number; rack_map_width: number; slots_per_level: number
+      status: string; slot_position: number; depth_position: number; rack_map_width: number; slots_per_level: number
     };
   if (anchor.merged_into_bin_id)
     throw Object.assign(new Error('Selecciona un hueco principal para crear la caja'), { status: 409 });
@@ -1279,15 +1350,15 @@ async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: st
     throw Object.assign(new Error('No se puede cambiar el tamaño de una ubicación bloqueada'), { status: 409 });
 
   const slots = await client.query(`
-      SELECT b.id, b.width_units, b.merged_into_bin_id, b.status,
+      SELECT b.id, b.width_units, b.depth_position, b.merged_into_bin_id, b.status,
              substring(b.code from '-([0-9]+)$')::int AS slot_position
-      FROM bins b WHERE b.rack_level_id = $1 ORDER BY b.code FOR UPDATE
-    `, [anchor.rack_level_id]);
+      FROM bins b WHERE b.rack_level_id = $1 AND b.depth_position = $2 ORDER BY b.code FOR UPDATE
+    `, [anchor.rack_level_id, anchor.depth_position]);
   const targetPositions = Array.from({ length: widthUnits }, (_value, index) => anchor.slot_position + index);
   const targetSlots = targetPositions.map((position) => slots.rows.find((slot) => slot.slot_position === position));
   if (targetSlots.some((slot) => !slot))
     throw Object.assign(new Error('No hay suficientes huecos contiguos a la derecha para ese tamaño'), { status: 400 });
-  const resolvedSlots = targetSlots as { id: string; width_units: number; merged_into_bin_id: string | null; status: string; slot_position: number }[];
+  const resolvedSlots = targetSlots as { id: string; width_units: number; depth_position: number; merged_into_bin_id: string | null; status: string; slot_position: number }[];
   if (resolvedSlots.some((slot) => slot.merged_into_bin_id && slot.merged_into_bin_id !== anchor.id))
     throw Object.assign(new Error('El tamaño solicitado se solapa con otra caja grande'), { status: 409 });
   if (resolvedSlots.some((slot) => slot.status !== 'active'))
@@ -1410,7 +1481,7 @@ app.get('/api/racks', async (req, res, next) => {
       return res.status(400).json({ error: 'Identificador de almacén no válido' });
     const warehouseId = requestedWarehouse.success ? requestedWarehouse.data : res.locals.warehouseId as string;
     const result = await pool.query(`
-      SELECT r.id, r.aisle_id, r.name, r.code, r.map_x, r.map_y, r.map_width, r.map_height,
+      SELECT r.id, r.aisle_id, r.name, r.code, r.map_x, r.map_y, r.map_width, r.map_height, r.depth_slots,
              z.name AS zone, a.code AS aisle,
              COALESCE(levels.level_count, 0)::int AS level_count,
              COALESCE(levels.bins_per_level, 0)::int AS bins_per_level,
@@ -1423,14 +1494,16 @@ app.get('/api/racks', async (req, res, next) => {
       LEFT JOIN LATERAL (
         SELECT count(DISTINCT rl.id) AS level_count,
                count(b.id) FILTER (WHERE b.merged_into_bin_id IS NULL) AS bin_count,
-               COALESCE(max(level_bins.bin_count), 0) AS bins_per_level,
+               COALESCE((SELECT max(depth_bins.bin_count) FROM (
+                 SELECT count(*)::int AS bin_count FROM rack_levels depth_levels
+                 JOIN bins depth_locations ON depth_locations.rack_level_id = depth_levels.id
+                 WHERE depth_levels.rack_id = r.id
+                 GROUP BY depth_levels.id, depth_locations.depth_position
+               ) depth_bins), 0) AS bins_per_level,
                COALESCE((SELECT json_agg(rl2.height_cm ORDER BY rl2.level_number)
                          FROM rack_levels rl2 WHERE rl2.rack_id = r.id), '[]'::json) AS level_heights
         FROM rack_levels rl
         LEFT JOIN bins b ON b.rack_level_id = rl.id
-        LEFT JOIN LATERAL (
-          SELECT count(*) AS bin_count FROM bins WHERE rack_level_id = rl.id
-        ) level_bins ON true
         WHERE rl.rack_id = r.id
       ) levels ON true
       LEFT JOIN LATERAL (
@@ -1450,11 +1523,12 @@ app.get('/api/racks', async (req, res, next) => {
 
 function assertRackFitsWarehouse(
   rack: RackBounds,
-  warehouse: { map_width: number; map_height: number; map_perimeter: MapPoint[] }
+  warehouse: { map_width: number; map_height: number; map_perimeter: MapPoint[]; map_structures?: WarehouseStructure[] }
 ) {
   if (rack.x + rack.width > Number(warehouse.map_width) ||
       rack.y + rack.height > Number(warehouse.map_height) ||
-      !isRackWithinPerimeter(rack, warehouse.map_perimeter ?? []))
+      !isRackWithinPerimeter(rack, warehouse.map_perimeter ?? []) ||
+      rackOverlapsStructures(rack, warehouse.map_structures ?? []))
     throw Object.assign(new Error('La estantería debe quedar completamente dentro del almacén'), { status: 400 });
 }
 
@@ -1464,6 +1538,7 @@ const rackConfigFields = {
   code: z.string().trim().regex(/^[A-Z0-9-]{2,24}$/),
   levelCount: z.coerce.number().int().min(1).max(12),
   binsPerLevel: z.coerce.number().int().min(1).max(12),
+  depthSlots: z.coerce.number().int().min(1).max(12).default(1),
   map_x: z.coerce.number().min(0).max(30000),
   map_y: z.coerce.number().min(0).max(30000),
   map_width: z.coerce.number().min(160).max(2000),
@@ -1472,11 +1547,13 @@ const rackConfigFields = {
 };
 
 function validateRackDimensions(
-  value: { levelCount: number; binsPerLevel: number; map_height: number; map_width: number; rackHeightCm?: number },
+  value: { levelCount: number; binsPerLevel: number; depthSlots: number; map_height: number; map_width: number; rackHeightCm?: number },
   ctx: z.RefinementCtx
 ) {
-  if (value.levelCount * value.binsPerLevel > 100)
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['binsPerLevel'], message: 'Una estantería no puede superar 100 ubicaciones' });
+  if (value.levelCount * value.binsPerLevel * value.depthSlots > 100)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['depthSlots'], message: 'Una estantería no puede superar 100 ubicaciones' });
+  if (value.depthSlots > maxRackDepthSlots(value.levelCount, value.binsPerLevel, value.map_height))
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['depthSlots'], message: 'Aumenta el fondo para añadir más filas de ubicaciones' });
   if (value.map_height < 48 + value.levelCount * 22)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['map_height'], message: 'Aumenta la altura para que quepan todos los niveles' });
   const levelHeights = value.rackHeightCm === undefined
@@ -1509,8 +1586,9 @@ async function getLocationCodePrefix(client: pg.PoolClient, aisleId: string, war
   return result.rows[0] as LocationCodePrefix;
 }
 
-function makeLocationCode(prefix: LocationCodePrefix, rackCode: string, level: number, position: number) {
-  const code = `${prefix.warehouse}-${prefix.zone}-${prefix.aisle}-${rackCode}-${String(level).padStart(2, '0')}-${String(position).padStart(2, '0')}`;
+function makeLocationCode(prefix: LocationCodePrefix, rackCode: string, level: number, position: number, depthPosition = 1) {
+  const depthCode = depthPosition === 1 ? '' : `-D${String(depthPosition).padStart(2, '0')}`;
+  const code = `${prefix.warehouse}-${prefix.zone}-${prefix.aisle}-${rackCode}-${String(level).padStart(2, '0')}${depthCode}-${String(position).padStart(2, '0')}`;
   return { code, barcode: `LOC-${code}` };
 }
 
@@ -1525,18 +1603,20 @@ async function addRackBins(client: pg.PoolClient, rackId: string, config: z.infe
       'INSERT INTO rack_levels (rack_id, level_number, height_cm) VALUES ($1, $2, $3) RETURNING id',
       [rackId, level, levelHeights[level - 1]]
     );
-    for (let position = 1; position <= config.binsPerLevel; position += 1) {
-      const { code, barcode } = makeLocationCode(prefix, config.code, level, position);
-      await client.query(
-        `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height)
-         VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-        [
-          insertedLevel.rows[0].id, code, barcode,
-          config.map_x + 22 + (position - 1) * (binWidth + 6),
-          config.map_y + 38 + (level - 1) * (binHeight + 8),
-          binWidth, binHeight
-        ]
-      );
+    for (let depthPosition = 1; depthPosition <= config.depthSlots; depthPosition += 1) {
+      for (let position = 1; position <= config.binsPerLevel; position += 1) {
+        const { code, barcode } = makeLocationCode(prefix, config.code, level, position, depthPosition);
+        await client.query(
+          `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height, depth_position)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+          [
+            insertedLevel.rows[0].id, code, barcode,
+            config.map_x + 22 + (position - 1) * (binWidth + 6),
+            config.map_y + 38 + (level - 1) * (binHeight + 8),
+            binWidth, binHeight, depthPosition
+          ]
+        );
+      }
     }
   }
 }
@@ -1560,7 +1640,7 @@ app.post('/api/racks', requireAdmin, async (req, res, next) => {
     );
     if (!aisle.rowCount) throw Object.assign(new Error('El pasillo seleccionado no existe'), { status: 404 });
     const warehouse = await client.query(
-      'SELECT map_width, map_height, map_perimeter FROM warehouses WHERE id = $1 FOR UPDATE',
+      'SELECT map_width, map_height, map_perimeter, map_structures FROM warehouses WHERE id = $1 FOR UPDATE',
       [res.locals.warehouseId]
     );
     assertRackFitsWarehouse({
@@ -1568,9 +1648,9 @@ app.post('/api/racks', requireAdmin, async (req, res, next) => {
     }, warehouse.rows[0]);
     const codePrefix = await getLocationCodePrefix(client, config.aisleId, res.locals.warehouseId as string);
     const rack = await client.query(
-      `INSERT INTO racks (aisle_id, name, code, map_x, map_y, map_width, map_height)
-       VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-      [config.aisleId, config.name, config.code, config.map_x, config.map_y, config.map_width, config.map_height]
+      `INSERT INTO racks (aisle_id, name, code, map_x, map_y, map_width, map_height, depth_slots)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+      [config.aisleId, config.name, config.code, config.map_x, config.map_y, config.map_width, config.map_height, config.depthSlots]
     );
     await addRackBins(client, rack.rows[0].id, config, codePrefix);
     await client.query('COMMIT');
@@ -1591,13 +1671,14 @@ app.patch('/api/racks/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, nex
   try {
     await client.query('BEGIN');
     const current = await client.query(`
-      SELECT r.id, r.code, r.map_x, r.map_y, r.map_width, r.map_height, r.aisle_id,
-             w.map_width AS warehouse_width, w.map_height AS warehouse_height, w.map_perimeter,
+      SELECT r.id, r.code, r.map_x, r.map_y, r.map_width, r.map_height, r.depth_slots, r.aisle_id,
+             w.map_width AS warehouse_width, w.map_height AS warehouse_height, w.map_perimeter, w.map_structures,
              (SELECT count(*)::int FROM rack_levels rl WHERE rl.rack_id = r.id) AS level_count,
              COALESCE((
                SELECT max(level_bins.bin_count) FROM (
                  SELECT count(*)::int AS bin_count FROM rack_levels rl
-                 JOIN bins b ON b.rack_level_id = rl.id WHERE rl.rack_id = r.id GROUP BY rl.id
+                 JOIN bins b ON b.rack_level_id = rl.id WHERE rl.rack_id = r.id
+                 GROUP BY rl.id, b.depth_position
                ) level_bins
              ), 0)::int AS bins_per_level
       FROM racks r JOIN aisles a ON a.id = r.aisle_id JOIN zones z ON z.id = a.zone_id
@@ -1605,20 +1686,22 @@ app.patch('/api/racks/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, nex
       WHERE r.id = $1 AND z.warehouse_id = $2 FOR UPDATE OF r, w
     `, [req.params.id, res.locals.warehouseId]);
     if (!current.rowCount) throw Object.assign(new Error('Estantería no encontrada'), { status: 404 });
-    const existing = current.rows[0] as { id: string; code: string; map_x: number; map_y: number; aisle_id: string; level_count: number; bins_per_level: number };
-    const warehouse = current.rows[0] as { warehouse_width: number; warehouse_height: number; map_perimeter: MapPoint[] };
+    const existing = current.rows[0] as { id: string; code: string; map_x: number; map_y: number; aisle_id: string; depth_slots: number; level_count: number; bins_per_level: number };
+    const warehouse = current.rows[0] as { warehouse_width: number; warehouse_height: number; map_perimeter: MapPoint[]; map_structures: WarehouseStructure[] };
     assertRackFitsWarehouse({
       x: config.map_x, y: config.map_y, width: config.map_width, height: config.map_height
-    }, { map_width: warehouse.warehouse_width, map_height: warehouse.warehouse_height, map_perimeter: warehouse.map_perimeter });
+    }, { map_width: warehouse.warehouse_width, map_height: warehouse.warehouse_height, map_perimeter: warehouse.map_perimeter, map_structures: warehouse.map_structures });
     const codePrefix = await getLocationCodePrefix(client, existing.aisle_id, res.locals.warehouseId as string);
-    if (config.levelCount < existing.level_count || config.binsPerLevel < existing.bins_per_level)
+    if (config.levelCount < existing.level_count ||
+        config.binsPerLevel < existing.bins_per_level ||
+        config.depthSlots < existing.depth_slots)
       throw Object.assign(new Error('No se pueden eliminar niveles o ubicaciones existentes. Puedes ampliarlos sin perder el historial.'), { status: 409 });
     if (config.binsPerLevel > existing.bins_per_level && config.binsPerLevel > maxRackBinsForWidth(config.map_width))
       throw Object.assign(new Error('El ancho no permite añadir tantos huecos por nivel'), { status: 400 });
 
     await client.query(
-      `UPDATE racks SET name = $1, code = $2, map_x = $3, map_y = $4, map_width = $5, map_height = $6 WHERE id = $7`,
-      [config.name, config.code, config.map_x, config.map_y, config.map_width, config.map_height, req.params.id]
+      `UPDATE racks SET name = $1, code = $2, map_x = $3, map_y = $4, map_width = $5, map_height = $6, depth_slots = $7 WHERE id = $8`,
+      [config.name, config.code, config.map_x, config.map_y, config.map_width, config.map_height, config.depthSlots, req.params.id]
     );
     const deltaX = config.map_x - Number(existing.map_x);
     const deltaY = config.map_y - Number(existing.map_y);
@@ -1645,52 +1728,56 @@ app.patch('/api/racks/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, nex
     for (const level of existingLevels) {
       if (requestedLevelHeights)
         await client.query('UPDATE rack_levels SET height_cm = $1 WHERE id = $2', [requestedLevelHeights[level.level_number - 1], level.id]);
-      const bins = await client.query('SELECT id, width_units FROM bins WHERE rack_level_id = $1 ORDER BY code', [level.id]);
-      for (let index = 0; index < bins.rows.length; index += 1) {
-        const { code, barcode } = makeLocationCode(codePrefix, config.code, level.level_number, index + 1);
+      const bins = await client.query(`
+        SELECT id, width_units, depth_position, substring(code from '-([0-9]+)$')::int AS slot_position
+        FROM bins WHERE rack_level_id = $1 ORDER BY depth_position, slot_position
+      `, [level.id]);
+      const existingPositions = new Set<string>();
+      for (const bin of bins.rows as { id: string; width_units: number; depth_position: number; slot_position: number }[]) {
+        const depthPosition = Number(bin.depth_position);
+        const slotPosition = Number(bin.slot_position);
+        existingPositions.add(`${depthPosition}:${slotPosition}`);
+        const { code, barcode } = makeLocationCode(codePrefix, config.code, level.level_number, slotPosition, depthPosition);
         await client.query(
           `UPDATE bins SET code = $1, barcode = $2,
              map_x = $3, map_y = $4, map_width = $5, map_height = $6
            WHERE id = $7`,
           [
             code, barcode,
-            config.map_x + 22 + index * (binWidth + 6),
+            config.map_x + 22 + (slotPosition - 1) * (binWidth + 6),
             config.map_y + 38 + (level.level_number - 1) * (binHeight + 8),
-            binWidth * Number(bins.rows[index].width_units) + 6 * (Number(bins.rows[index].width_units) - 1),
-            binHeight, bins.rows[index].id
+            binWidth * Number(bin.width_units) + 6 * (Number(bin.width_units) - 1),
+            binHeight, bin.id
           ]
         );
+      }
+      for (let depthPosition = 1; depthPosition <= config.depthSlots; depthPosition += 1) {
+        for (let position = 1; position <= config.binsPerLevel; position += 1) {
+          if (existingPositions.has(`${depthPosition}:${position}`)) continue;
+          const { code, barcode } = makeLocationCode(codePrefix, config.code, level.level_number, position, depthPosition);
+          await client.query(
+            `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height, depth_position)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+            [level.id, code, barcode, config.map_x + 22 + (position - 1) * (binWidth + 6),
+              config.map_y + 38 + (level.level_number - 1) * (binHeight + 8), binWidth, binHeight, depthPosition]
+          );
+        }
       }
     }
     for (let levelNumber = existing.level_count + 1; levelNumber <= config.levelCount; levelNumber += 1) {
       const heightCm = requestedLevelHeights?.[levelNumber - 1] ?? 240;
       const level = await client.query('INSERT INTO rack_levels (rack_id, level_number, height_cm) VALUES ($1, $2, $3) RETURNING id', [req.params.id, levelNumber, heightCm]);
-      for (let position = 1; position <= config.binsPerLevel; position += 1) {
-        const { code, barcode } = makeLocationCode(codePrefix, config.code, levelNumber, position);
-        await client.query(
-          `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height)
-           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-          [
-            level.rows[0].id, code, barcode,
-            config.map_x + 22 + (position - 1) * (binWidth + 6),
-            config.map_y + 38 + (levelNumber - 1) * (binHeight + 8),
-            binWidth, binHeight
-          ]
-        );
-      }
-    }
-    if (config.binsPerLevel > existing.bins_per_level) {
-      for (const level of levels.rows as { id: string; level_number: number }[]) {
-        for (let position = existing.bins_per_level + 1; position <= config.binsPerLevel; position += 1) {
-          const { code, barcode } = makeLocationCode(codePrefix, config.code, level.level_number, position);
+      for (let depthPosition = 1; depthPosition <= config.depthSlots; depthPosition += 1) {
+        for (let position = 1; position <= config.binsPerLevel; position += 1) {
+          const { code, barcode } = makeLocationCode(codePrefix, config.code, levelNumber, position, depthPosition);
           await client.query(
-            `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height)
-             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height, depth_position)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
             [
-              level.id, code, barcode,
+              level.rows[0].id, code, barcode,
               config.map_x + 22 + (position - 1) * (binWidth + 6),
-              config.map_y + 38 + (level.level_number - 1) * (binHeight + 8),
-              binWidth, binHeight
+              config.map_y + 38 + (levelNumber - 1) * (binHeight + 8),
+              binWidth, binHeight, depthPosition
             ]
           );
         }
@@ -1721,7 +1808,7 @@ app.patch('/api/racks/map', requireAdmin, async (req, res, next) => {
     for (const rack of parsed.data) {
       const current = await client.query(`
         SELECT r.map_x, r.map_y, r.map_width, r.map_height,
-               w.map_width AS warehouse_width, w.map_height AS warehouse_height, w.map_perimeter
+               w.map_width AS warehouse_width, w.map_height AS warehouse_height, w.map_perimeter, w.map_structures
         FROM racks r
         JOIN aisles a ON a.id = r.aisle_id JOIN zones z ON z.id = a.zone_id
         JOIN warehouses w ON w.id = z.warehouse_id
@@ -1729,14 +1816,16 @@ app.patch('/api/racks/map', requireAdmin, async (req, res, next) => {
       `, [rack.id, res.locals.warehouseId]);
       if (!current.rowCount) throw Object.assign(new Error('Estantería no encontrada'), { status: 404 });
       const currentRack = current.rows[0] as {
-        map_width: number; map_height: number; warehouse_width: number; warehouse_height: number; map_perimeter: MapPoint[];
+        map_width: number; map_height: number; warehouse_width: number; warehouse_height: number;
+        map_perimeter: MapPoint[]; map_structures: WarehouseStructure[];
       };
       assertRackFitsWarehouse({
         x: rack.map_x, y: rack.map_y, width: Number(currentRack.map_width), height: Number(currentRack.map_height)
       }, {
         map_width: currentRack.warehouse_width,
         map_height: currentRack.warehouse_height,
-        map_perimeter: currentRack.map_perimeter
+        map_perimeter: currentRack.map_perimeter,
+        map_structures: currentRack.map_structures
       });
       await client.query('UPDATE racks SET map_x = $1, map_y = $2 WHERE id = $3', [rack.map_x, rack.map_y, rack.id]);
       await client.query(
@@ -2714,6 +2803,10 @@ async function start() {
     ));
     await pool.query(readFileSync(
       resolve(apiRoot, 'src/db/migrations/009-rack-dimensions.sql'),
+      'utf8'
+    ));
+    await pool.query(readFileSync(
+      resolve(apiRoot, 'src/db/migrations/010-rack-depth-and-structures.sql'),
       'utf8'
     ));
     await pool.query(`

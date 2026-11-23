@@ -9,6 +9,7 @@ type RackLocation = {
   display_name: string | null;
   level_number: number;
   slot_position: number;
+  depth_position: number;
   width_units: number;
   quantity: string | number;
   products: { productId: string; sku: string; name: string; quantity: string | number; lot: string | null }[];
@@ -20,6 +21,7 @@ type Rack = {
   map_height: string | number;
   level_count: number;
   bins_per_level: number;
+  depth_slots: number;
   level_heights: (string | number)[];
 };
 
@@ -70,7 +72,10 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
   const usableWidth = width - uprightWidth * 2;
   const slotPitch = usableWidth / Math.max(1, rack.bins_per_level);
   const boxGap = Math.min(0.06, slotPitch * 0.15);
-  const boxDepth = Math.max(0.2, depth * 0.72);
+  const depthSlots = Math.max(1, rack.depth_slots || 1);
+  const usableDepth = depth * 0.72;
+  const depthPitch = usableDepth / depthSlots;
+  const boxDepth = depthSlots === 1 ? usableDepth : Math.max(0.05, depthPitch * 0.9);
 
   return (
     <>
@@ -106,6 +111,8 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
         const levelIndex = Math.max(0, Math.min(rack.level_count - 1, location.level_number - 1));
         const levelY = levelPositions[levelIndex] ?? 1;
         const x = -width / 2 + uprightWidth + slotPitch * (location.slot_position - 1 + location.width_units / 2);
+        const depthIndex = Math.max(0, Math.min(depthSlots - 1, location.depth_position - 1));
+        const z = usableDepth / 2 - depthPitch * (depthIndex + 0.5);
         const slotWidth = slotPitch * location.width_units - boxGap;
         const levelSpacing = Math.max(0.01, number(rack.level_heights[levelIndex] ?? 240) / 100);
         const boxHeight = Math.min(0.62, Math.max(0.12, levelSpacing * 0.65));
@@ -119,7 +126,7 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
         return (
           <group key={location.id}>
             <mesh
-              position={[x, levelY + boxHeight / 2 + beamHeight / 2, 0]}
+              position={[x, levelY + boxHeight / 2 + beamHeight / 2, z]}
               castShadow
               onClick={isSelectable ? (event) => {
                 event.stopPropagation();
@@ -134,7 +141,7 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
                 emissiveIntensity={isSelected ? 0.25 : isHighlighted ? 0.12 : 0}
               />
             </mesh>
-            {showLocationLabels && number(location.quantity) > 0 && <Html position={[x, levelY + boxHeight + beamHeight / 2 + 0.08, 0]} center distanceFactor={8} zIndexRange={[10, 0]} style={{ pointerEvents: 'none', whiteSpace: 'nowrap' }}><span className="rack-bin-name">{location.display_name || location.code}</span></Html>}
+            {showLocationLabels && number(location.quantity) > 0 && <Html position={[x, levelY + boxHeight + beamHeight / 2 + 0.08, z]} center distanceFactor={8} zIndexRange={[10, 0]} style={{ pointerEvents: 'none', whiteSpace: 'nowrap' }}><span className="rack-bin-name">{location.display_name || location.code}</span></Html>}
           </group>
         );
       })}

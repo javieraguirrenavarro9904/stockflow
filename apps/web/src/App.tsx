@@ -8,7 +8,10 @@ import {
 } from 'lucide-react';
 import { QRCodeSVG } from 'qrcode.react';
 import WarehouseMap2D from './WarehouseMap2D';
-import { cargarPlanoJSON, exportarPlanoJSON, isRackWithinPerimeter, MAP_GRID_SIZE, MAP_RENDER_SCALE, type WarehousePoint } from './warehousePlan';
+import {
+  cargarPlanoJSON, exportarPlanoJSON, isRackWithinPerimeter,
+  rackOverlapsStructures, MAP_GRID_SIZE, MAP_RENDER_SCALE, type WarehousePoint, type WarehouseStructure
+} from './warehousePlan';
 import { PurchasingPage, SalesOrdersPage, type PurchaseOrder, type ReplenishmentItem, type SalesOrder } from './BusinessPages';
 
 const API = (import.meta.env.VITE_API_URL ?? (import.meta.env.DEV ? 'http://localhost:3001/api' : '')).replace(/\/+$/, '');
@@ -28,7 +31,10 @@ type Product = {
 
 type CatalogOption = { id: string; name: string };
 type ExpectedProduct = { productId: string; sku: string; name: string; quantity: string | number };
-type Warehouse = { id: string; name: string; code: string; map_width: string | number; map_height: string | number; map_perimeter?: WarehousePoint[] };
+type Warehouse = {
+  id: string; name: string; code: string; map_width: string | number; map_height: string | number;
+  map_perimeter?: WarehousePoint[]; map_structures?: WarehouseStructure[];
+};
 type WarehouseMap = Warehouse;
 type Aisle = {
   id: string; zone_id: string; name: string; code: string; zone: string;
@@ -38,7 +44,7 @@ type Location = {
   id: string; code: string; barcode: string | null; capacity: string | null; display_name: string | null;
   warehouse_id: string; warehouse: string;
   map_x: string | number; map_y: string | number; map_width: string | number; map_height: string | number;
-  width_units: number; slot_position: number;
+  width_units: number; slot_position: number; depth_position: number;
   status: string; zone: string; aisle_id: string; aisle: string; rack_id: string; rack: string; level_number: number;
   quantity: string | number; products: { productId: string; sku: string; name: string; quantity: string | number; lot: string | null }[];
   expected_products: ExpectedProduct[];
@@ -46,7 +52,7 @@ type Location = {
 type Rack = {
   id: string; aisle_id: string; name: string; code: string;
   map_x: string | number; map_y: string | number; map_width: string | number; map_height: string | number;
-  zone: string; aisle: string; level_count: number; bins_per_level: number; bin_count: number;
+  zone: string; aisle: string; level_count: number; bins_per_level: number; depth_slots: number; bin_count: number;
   level_heights: (string | number)[]; units: string | number;
 };
 type UserEntry = AuthUser & { active: boolean; created_at: string };
@@ -962,13 +968,20 @@ function WarehouseForm({ onSubmit, onCancel }: { onSubmit: (event: FormEvent<HTM
 function RackConfigForm({ rack, onChange, onDelete }: {
   rack: Rack; onChange: (field: string, value: string | number) => void; onDelete: () => void
 }) {
-  const maximumBins = Math.max(rack.bins_per_level, maxRackBinsForWidth(number(rack.map_width)));
+  const maximumBins = Math.max(rack.bins_per_level, Math.min(
+    maxRackBinsForWidth(number(rack.map_width)),
+    Math.floor(100 / (rack.level_count * rack.depth_slots))
+  ));
+  const maximumDepthSlots = Math.max(rack.depth_slots, maxRackDepthSlots(rack.level_count, rack.bins_per_level, number(rack.map_height)));
+  const minimumDepth = Math.max(130, Math.ceil(rack.depth_slots * 20 / 0.72));
+  const maximumLevels = Math.max(rack.level_count, Math.min(12, Math.floor(100 / (rack.bins_per_level * rack.depth_slots))));
   const totalHeight = calculateRackHeightCm(rack.level_heights.map(number));
   return <div className="rack-config-form">
     <label>Nombre<input required minLength={2} maxLength={100} value={rack.name} onChange={(event) => onChange('name', event.target.value)} /></label>
     <label>Código<input required pattern="[A-Za-z0-9-]{2,24}" value={rack.code} onChange={(event) => onChange('code', event.target.value.toUpperCase())} /></label>
-    <div className="form-row"><label>Niveles<input type="number" min={rack.level_count} max="12" value={rack.level_count} onChange={(event) => onChange('level_count', Number(event.target.value))} /></label><label>Huecos / nivel<input type="number" min={rack.bins_per_level} max={maximumBins} value={rack.bins_per_level} onChange={(event) => onChange('bins_per_level', Number(event.target.value))} /></label></div>
-    <div className="form-row"><label>Ancho (cm)<input type="number" min={Math.min(220, number(rack.map_width))} max="2000" step="10" value={number(rack.map_width)} onChange={(event) => onChange('map_width', Number(event.target.value))} /></label><label>Fondo (cm)<input type="number" min="130" max="1200" step="10" value={number(rack.map_height)} onChange={(event) => onChange('map_height', Number(event.target.value))} /></label></div>
+    <div className="form-row"><label>Niveles<input type="number" min={rack.level_count} max={maximumLevels} value={rack.level_count} onChange={(event) => onChange('level_count', Number(event.target.value))} /></label><label>Huecos / nivel<input type="number" min={rack.bins_per_level} max={maximumBins} value={rack.bins_per_level} onChange={(event) => onChange('bins_per_level', Number(event.target.value))} /></label></div>
+    <div className="form-row"><label>Ancho (cm)<input type="number" min={Math.min(220, number(rack.map_width))} max="2000" step="10" value={number(rack.map_width)} onChange={(event) => onChange('map_width', Number(event.target.value))} /><small className="field-help">Mínimo: {Math.min(220, number(rack.map_width))} cm · Máximo: 2000 cm.</small></label><label>Fondo (cm)<input type="number" min={minimumDepth} max="1200" step="10" value={number(rack.map_height)} onChange={(event) => onChange('map_height', Number(event.target.value))} /><small className="field-help">Mínimo: {minimumDepth} cm · Máximo: 1200 cm.</small></label></div>
+    <label>Huecos de fondo<input type="number" min={rack.depth_slots} max={maximumDepthSlots} value={rack.depth_slots} onChange={(event) => onChange('depth_slots', Number(event.target.value))} /></label>
     <div className="rack-level-heights"><strong>Separación vertical de cada nivel</strong><span>Altura total: {totalHeight} cm · máximo 1200 cm</span>{rack.level_heights.map((height, index) => <label key={index}>Nivel {index + 1} (cm)<input type="number" min="30" max="1000" value={number(height)} onChange={(event) => onChange(`height_${index}`, Number(event.target.value))} /></label>)}</div>
     <small className="rack-config-note">Los niveles y huecos con historial no se pueden reducir ni eliminar.</small>
     <button className="button button-danger full-button" onClick={onDelete}><Archive size={15} /> Eliminar estantería</button>
@@ -1046,7 +1059,7 @@ function InventoryPage({ products, locations, search, isAdmin, onAdd, onEdit, on
 
 type RackCreationValues = {
   aisleId: string; name: string; code: string; width: number; depth: number;
-  binsPerLevel: number; levelHeights: number[];
+  binsPerLevel: number; depthSlots: number; levelHeights: number[];
 };
 
 const RACK_BASE_HEIGHT_CM = 12;
@@ -1096,6 +1109,10 @@ function maxRackBinsForWidth(widthCm: number) {
   return Math.max(1, Math.min(12, Math.floor((widthCm - 44) / 38)));
 }
 
+function maxRackDepthSlots(levelCount: number, binsPerLevel: number, depthCm: number) {
+  return Math.max(1, Math.min(12, Math.floor(depthCm * 0.72 / 20), Math.floor(100 / (levelCount * binsPerLevel))));
+}
+
 function RackCreationForm({ initialAisleId, initialWidth, initialDepth, maxWidth, maxDepth, existingCodes, onSubmit, onCancel }: {
   initialAisleId: string; initialWidth: number; initialDepth: number; maxWidth: number; maxDepth: number;
   existingCodes: string[]; onSubmit: (values: RackCreationValues) => void; onCancel: () => void
@@ -1105,7 +1122,10 @@ function RackCreationForm({ initialAisleId, initialWidth, initialDepth, maxWidth
   const [levelHeights, setLevelHeights] = useState(() => makeRackLevelHeights(240, 3));
   const [rackHeightInput, setRackHeightInput] = useState(() => String(calculateRackHeightCm(makeRackLevelHeights(240, 3))));
   const [rackWidth, setRackWidth] = useState(initialWidth);
+  const [rackDepth, setRackDepth] = useState(initialDepth);
   const [binsPerLevel, setBinsPerLevel] = useState(Math.min(4, maxRackBinsForWidth(initialWidth)));
+  const [depthSlots, setDepthSlots] = useState(1);
+  const maximumDepthSlots = maxRackDepthSlots(levelCount, binsPerLevel, rackDepth);
   const [codeError, setCodeError] = useState('');
   const [dimensionError, setDimensionError] = useState('');
   const [code, setCode] = useState(() => {
@@ -1125,6 +1145,7 @@ function RackCreationForm({ initialAisleId, initialWidth, initialDepth, maxWidth
     setLevelCount(count);
     setLevelHeights(nextLevelHeights);
     setRackHeightInput(String(calculateRackHeightCm(nextLevelHeights)));
+    setDepthSlots((current) => Math.min(current, maxRackDepthSlots(count, binsPerLevel, rackDepth)));
   };
 
   return <form className="rack-wizard-form" onSubmit={(event) => {
@@ -1153,8 +1174,9 @@ function RackCreationForm({ initialAisleId, initialWidth, initialDepth, maxWidth
       name: String(form.get('name')).trim(),
       code: rackCode,
       width: Number(form.get('width')),
-      depth: Number(form.get('depth')),
+      depth: rackDepth,
       binsPerLevel: Number(form.get('binsPerLevel')),
+      depthSlots,
       levelHeights: submittedLevelHeights
     });
   }}>
@@ -1162,11 +1184,21 @@ function RackCreationForm({ initialAisleId, initialWidth, initialDepth, maxWidth
     <div className="form-row"><label>Nombre<input name="name" required minLength={2} maxLength={100} defaultValue="Estantería nueva" /></label><label>Código<input name="code" required pattern="[A-Za-z0-9-]{2,24}" value={code} onChange={(event) => { setCode(event.target.value.toUpperCase()); setCodeError(''); }} />{codeError && <small className="rack-form-error">{codeError}</small>}</label></div>
     <div className="form-row"><label>Ancho (cm)<input name="width" type="number" min="220" max={maxWidth} step="10" value={rackWidth} onChange={(event) => {
       const width = Number(event.target.value);
+      const nextBinsPerLevel = Math.min(binsPerLevel, maxRackBinsForWidth(width));
       setRackWidth(width);
-      setBinsPerLevel((current) => Math.min(current, maxRackBinsForWidth(width)));
-    }} required /></label><label>Fondo (cm)<input name="depth" type="number" min="130" max={maxDepth} step="10" defaultValue={initialDepth} required /></label></div>
-    <div className="form-row"><label>Número de niveles<input type="number" min="1" max="12" value={levelCount} onChange={(event) => changeLevelCount(Number(event.target.value))} required /></label><label>Huecos por nivel<input name="binsPerLevel" type="number" min="1" max={maxRackBinsForWidth(rackWidth)} value={binsPerLevel} onChange={(event) => setBinsPerLevel(Math.max(1, Math.min(maxRackBinsForWidth(rackWidth), Number(event.target.value))))} required /></label></div>
-    <label>Altura total (cm)<input type="number" min={Math.ceil(getMinimumRackHeightCm(levelCount))} max={getMaximumRackHeightCm(levelCount)} value={rackHeightInput} onChange={(event) => {
+      setBinsPerLevel(nextBinsPerLevel);
+      setDepthSlots((current) => Math.min(current, maxRackDepthSlots(levelCount, nextBinsPerLevel, rackDepth)));
+    }} required /><small className="field-help">Mínimo: 220 cm · Máximo: {maxWidth} cm.</small></label><label>Fondo (cm)<input name="depth" type="number" min={Math.max(130, Math.ceil(depthSlots * 20 / 0.72))} max={maxDepth} step="10" value={rackDepth} onChange={(event) => {
+      const depth = Number(event.target.value);
+      setRackDepth(depth);
+      setDepthSlots((current) => Math.min(current, maxRackDepthSlots(levelCount, binsPerLevel, depth)));
+    }} required /><small className="field-help">Mínimo: {Math.max(130, Math.ceil(depthSlots * 20 / 0.72))} cm · Máximo: {maxDepth} cm.</small></label></div>
+    <div className="form-row"><label>Número de niveles<input type="number" min="1" max="12" value={levelCount} onChange={(event) => changeLevelCount(Number(event.target.value))} required /><small className="field-help">Mínimo: 1 · Máximo: 12 niveles.</small></label><label>Huecos por nivel<input name="binsPerLevel" type="number" min="1" max={maxRackBinsForWidth(rackWidth)} value={binsPerLevel} onChange={(event) => {
+      const nextBinsPerLevel = Math.max(1, Math.min(maxRackBinsForWidth(rackWidth), Number(event.target.value)));
+      setBinsPerLevel(nextBinsPerLevel);
+      setDepthSlots((current) => Math.min(current, maxRackDepthSlots(levelCount, nextBinsPerLevel, rackDepth)));
+    }} required /></label></div>
+    <div className="form-row"><label>Huecos de fondo<input name="depthSlots" type="number" min="1" max={maximumDepthSlots} value={depthSlots} onChange={(event) => setDepthSlots(Math.max(1, Math.min(maximumDepthSlots, Number(event.target.value))))} required /><small className="field-help">Máximo: {maximumDepthSlots} filas por nivel · 100 ubicaciones por estantería.</small></label><label>Altura total (cm)<input type="number" min={Math.ceil(getMinimumRackHeightCm(levelCount))} max={getMaximumRackHeightCm(levelCount)} value={rackHeightInput} onChange={(event) => {
       const value = event.target.value;
       setRackHeightInput(value);
       if (value !== '' && Number.isFinite(Number(value)))
@@ -1178,7 +1210,7 @@ function RackCreationForm({ initialAisleId, initialWidth, initialDepth, maxWidth
         : levelHeights;
       setLevelHeights(nextLevelHeights);
       setRackHeightInput(String(calculateRackHeightCm(nextLevelHeights)));
-    }} required /><small className="field-help">Altura máxima: 1200 cm (12 m). Los niveles se reparten dentro de esta altura.</small></label>
+    }} required /><small className="field-help">Mínimo: {Math.ceil(getMinimumRackHeightCm(levelCount))} cm · Máximo: {getMaximumRackHeightCm(levelCount)} cm. Los niveles se reparten dentro de esta altura.</small></label></div>
     {dimensionError && <small className="rack-form-error">{dimensionError}</small>}
     <div className="rack-wizard-levels"><strong>Separación vertical de cada nivel</strong><span>Se calcula desde la altura total; puedes ajustar cada balda.</span>{levelHeights.map((height, index) => <label key={index}><span>Nivel {index + 1}</span><input type="number" min={RACK_MIN_LEVEL_SPACING_CM} max="1000" value={height} onChange={(event) => {
       const nextLevelHeights = levelHeights.map((item, position) => position === index ? Number(event.target.value) : item);
@@ -1526,7 +1558,7 @@ export function LegacyMapPage({ locations, racks, selected, isAdmin, onSelect, o
           <div className="rack-detail-actions">{isAdmin && <button className="button button-secondary" onClick={() => setEditMode((editing) => !editing)}><Settings2 size={15} /> {editMode ? 'Ocultar ajustes' : 'Configurar estantería'}</button>}</div>
           {isAdmin && editMode && <RackConfigForm key={`${selectedRack.id}-${selectedRack.code}-${selectedRack.map_width}-${selectedRack.map_height}`} rack={selectedRack} onChange={() => undefined} onDelete={() => undefined} />}
           <div className="location-products-heading"><h3>Ubicaciones por nivel</h3><span>{selectedRack.bin_count}</span></div>
-          <div className="rack-bin-details">{rackLevels.map(({ level, bins }) => <section key={level}><strong className="rack-level-title">Nivel {level}</strong>{bins.map((bin) => <button className={`rack-bin-detail ${selected?.id === bin.id ? 'selected' : ''}`} key={bin.id} onClick={() => onSelect(bin)}><span><strong>{bin.code}</strong><small>{bin.products.length ? bin.products.map((product) => product.name).join(', ') : 'Disponible'}</small></span><b>{formatNumber(bin.quantity)} uds.</b></button>)}</section>)}</div>
+          <div className="rack-bin-details">{rackLevels.map(({ level, bins }) => <section key={level}><strong className="rack-level-title">Nivel {level}</strong>{bins.map((bin) => <button className={`rack-bin-detail ${selected?.id === bin.id ? 'selected' : ''}`} key={bin.id} onClick={() => onSelect(bin)}><span><strong>{bin.code}</strong><small>Fondo {bin.depth_position} · {bin.products.length ? bin.products.map((product) => product.name).join(', ') : 'Disponible'}</small></span><b>{formatNumber(bin.quantity)} uds.</b></button>)}</section>)}</div>
           {selected && <div className="selected-bin-card"><div className="location-products-heading"><h3>Ubicación {selected.code}</h3><span>{selected.products.length} productos</span></div>
             <div className="location-products">{selected.products.map((product) => <div className="location-product" key={`${product.productId}-${product.lot}`}><div className="product-thumb thumb-0"><Package size={16} /></div><div><strong>{product.name}</strong><small>{product.sku}{product.lot ? ` · Lote ${product.lot}` : ''}</small></div><b>{formatNumber(product.quantity)} uds.</b></div>)}
               {!selected.products.length && <div className="location-empty">Esta ubicación está disponible.</div>}
@@ -1563,6 +1595,10 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
   const [rackDraft, setRackDraft] = useState<Rack[]>(racks);
   const [warehouseDraft, setWarehouseDraft] = useState(warehouse);
   const [rackWizard, setRackWizard] = useState<{ aisleId: string; x: number; y: number } | null>(null);
+  const [structures, setStructures] = useState<WarehouseStructure[]>(warehouse.map_structures ?? []);
+  const [structureDraft, setStructureDraft] = useState<WarehouseStructure[]>(warehouse.map_structures ?? []);
+  const [drawingStructureType, setDrawingStructureType] = useState<WarehouseStructure['type'] | null>(null);
+  const [selectedStructureId, setSelectedStructureId] = useState<string | null>(null);
   const [perimeter, setPerimeter] = useState<WarehousePoint[]>([]);
   const [perimeterDraft, setPerimeterDraft] = useState<WarehousePoint[]>([]);
   const [drawingPerimeter, setDrawingPerimeter] = useState(false);
@@ -1575,16 +1611,25 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
   useEffect(() => {
     try {
       const saved = localStorage.getItem(perimeterStorageKey);
-      const savedPerimeter = saved ? cargarPlanoJSON(saved).perimeter.map(([x, y]) => ({ x, y })) : [];
+      const savedPlan = saved ? cargarPlanoJSON(saved) : null;
+      const savedPerimeter = savedPlan?.perimeter.map(([x, y]) => ({ x, y })) ?? [];
       setPerimeter(warehouse.map_perimeter?.length ? warehouse.map_perimeter : savedPerimeter);
+      const savedStructures = savedPlan?.structures ?? [];
+      const currentStructures = warehouse.map_structures?.length ? warehouse.map_structures : savedStructures;
+      setStructures(currentStructures);
+      setStructureDraft(currentStructures);
     } catch (reason) {
       setPerimeter([]);
+      setStructures(warehouse.map_structures ?? []);
+      setStructureDraft(warehouse.map_structures ?? []);
       onNotify(reason instanceof Error ? `No se pudo cargar el perímetro: ${reason.message}` : 'No se pudo cargar el perímetro.');
     }
     setPerimeterDraft([]);
     setDrawingPerimeter(false);
+    setDrawingStructureType(null);
     setEditingPerimeter(false);
-  }, [warehouse.id, warehouse.map_perimeter]);
+    setDrawingStructureType(null);
+  }, [warehouse.id, warehouse.map_perimeter, warehouse.map_structures]);
 
   useEffect(() => {
     if (editMode) return;
@@ -1610,12 +1655,17 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
   const startEditing = () => {
     setRackDraft(racks.map((rack) => ({ ...rack, level_heights: rack.level_heights.map(number) })));
     setWarehouseDraft({ ...warehouse });
+    setStructureDraft(structures.map((structure) => ({ ...structure })));
+    setSelectedStructureId(null);
     setEditMode(true);
   };
 
   const discardChanges = () => {
     setRackDraft(racks);
     setWarehouseDraft(warehouse);
+    setStructureDraft(structures);
+    setDrawingStructureType(null);
+    setSelectedStructureId(null);
     setPerimeterDraft([]);
     setDrawingPerimeter(false);
     setEditingPerimeter(false);
@@ -1630,18 +1680,31 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
         body: JSON.stringify({
           warehouse: { map_width: number(warehouseDraft.map_width), map_height: number(warehouseDraft.map_height) },
           perimeter,
+          structures: structureDraft,
           aisles: aisles.map(({ zone, ...aisle }) => aisle),
-          racks: rackDraft.map(({ id, aisle_id, zone, aisle, level_count, bins_per_level, bin_count, units, level_heights, ...rack }) => ({
+          racks: rackDraft.map(({ id, aisle_id, zone, aisle, level_count, bins_per_level, depth_slots, bin_count, units, level_heights, ...rack }) => ({
             ...rack,
             ...(id.startsWith('draft-') ? { clientId: id } : { id }),
             aisleId: aisle_id,
             binsPerLevel: number(bins_per_level),
+            depthSlots: number(depth_slots),
             levelHeights: level_heights.map(number)
           })),
           deleteRackIds: racks.filter((rack) => !rackDraft.some((draft) => draft.id === rack.id)).map((rack) => rack.id),
           deleteAisleIds: []
         })
       });
+      setStructures(structureDraft);
+      localStorage.setItem(perimeterStorageKey, JSON.stringify(exportarPlanoJSON(
+        perimeter.length ? perimeter : [
+          { x: 4, y: 4 },
+          { x: Math.max(4, number(warehouseDraft.map_width) - 4), y: 4 },
+          { x: Math.max(4, number(warehouseDraft.map_width) - 4), y: Math.max(4, number(warehouseDraft.map_height) - 4) },
+          { x: 4, y: Math.max(4, number(warehouseDraft.map_height) - 4) }
+        ],
+        rackDraft,
+        structureDraft
+      )));
       setEditMode(false);
       setSelectedRackId(null);
       onSelect(null);
@@ -1662,9 +1725,28 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
         return { ...rack, level_heights: rack.level_heights.map((height, position) => position === index ? value : height) };
       }
       if (field === 'level_count') {
-        const count = Math.max(1, Math.min(12, Number(value)));
+        const maximumLevels = Math.max(rack.level_count, Math.min(12, Math.floor(100 / (rack.bins_per_level * rack.depth_slots))));
+        const count = Math.max(rack.level_count, Math.min(maximumLevels, Number(value)));
         const totalHeight = calculateRackHeightCm(rack.level_heights.map(number));
-        return { ...rack, level_count: count, level_heights: makeRackLevelHeights(totalHeight, count) };
+        return {
+          ...rack, level_count: count,
+          bin_count: count * rack.bins_per_level * rack.depth_slots,
+          level_heights: makeRackLevelHeights(totalHeight, count)
+        };
+      }
+      if (field === 'bins_per_level') {
+        const maximumBins = Math.max(rack.bins_per_level, Math.min(
+          maxRackBinsForWidth(number(rack.map_width)),
+          Math.floor(100 / (rack.level_count * rack.depth_slots))
+        ));
+        const binsPerLevel = Math.max(rack.bins_per_level, Math.min(maximumBins, Number(value)));
+        return { ...rack, bins_per_level: binsPerLevel, bin_count: rack.level_count * binsPerLevel * rack.depth_slots };
+      }
+      if (field === 'depth_slots') {
+        const depthSlots = Math.max(rack.depth_slots, Math.min(
+          maxRackDepthSlots(rack.level_count, rack.bins_per_level, number(rack.map_height)), Number(value)
+        ));
+        return { ...rack, depth_slots: depthSlots, bin_count: rack.level_count * rack.bins_per_level * depthSlots };
       }
       return { ...rack, [field]: value };
     }));
@@ -1689,7 +1771,11 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
 
   const addElementAt = (x: number, y: number) => openRackWizard(x, y);
 
-  const savePerimeter = (points: WarehousePoint[], message = 'Perímetro actualizado; guarda el plano para aplicarlo al almacén') => {
+  const savePerimeter = (
+    points: WarehousePoint[],
+    message = 'Perímetro actualizado; guarda el plano para aplicarlo al almacén',
+    nextStructures = structureDraft
+  ) => {
     try {
       const rectangle = [
         { x: 4, y: 4 },
@@ -1697,8 +1783,10 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
         { x: Math.max(4, canvasWidth - 4), y: Math.max(4, canvasHeight - 4) },
         { x: 4, y: Math.max(4, canvasHeight - 4) }
       ];
-      localStorage.setItem(perimeterStorageKey, JSON.stringify(exportarPlanoJSON(points.length ? points : rectangle, activeRacks)));
+      localStorage.setItem(perimeterStorageKey, JSON.stringify(exportarPlanoJSON(points.length ? points : rectangle, activeRacks, nextStructures)));
       setPerimeter(points);
+      setStructures(nextStructures);
+      setStructureDraft(nextStructures);
       setPerimeterDraft([]);
       setDrawingPerimeter(false);
       setEditingPerimeter(false);
@@ -1722,7 +1810,42 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
       window.alert('Todas las estanterías deben quedar completamente dentro del perímetro.');
       return;
     }
+    if (!structureDraft.every((structure) => isRackWithinPerimeter(structure, perimeterDraft))) {
+      window.alert('Todas las paredes y puertas deben quedar dentro del perímetro.');
+      return;
+    }
     savePerimeter(perimeterDraft);
+  };
+
+  const setStructureDrawingMode = (type: WarehouseStructure['type']) => {
+    setDrawingPerimeter(false);
+    setPerimeterDraft([]);
+    setEditingPerimeter(false);
+    setSelectedStructureId(null);
+    setDrawingStructureType((current) => current === type ? null : type);
+  };
+
+  const addStructure = (structure: WarehouseStructure) => {
+    if (structure.x + structure.width > canvasWidth || structure.y + structure.height > canvasHeight ||
+        !isRackWithinPerimeter(structure, perimeter)) {
+      window.alert('La pared o puerta debe quedar dentro del perímetro y las dimensiones del almacén.');
+      return;
+    }
+    if (activeRacks.some((rack) => rackOverlapsStructures({
+      x: number(rack.map_x), y: number(rack.map_y),
+      width: number(rack.map_width), height: number(rack.map_height)
+    }, [structure]))) {
+      window.alert('No se puede dibujar una pared o puerta sobre una estantería.');
+      return;
+    }
+    setStructureDraft((current) => [...current, structure]);
+    setSelectedStructureId(structure.id);
+  };
+
+  const removeSelectedStructure = () => {
+    if (!selectedStructureId) return;
+    setStructureDraft((current) => current.filter((structure) => structure.id !== selectedStructureId));
+    setSelectedStructureId(null);
   };
 
   const exportPlan = () => {
@@ -1732,7 +1855,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
       { x: Math.max(4, canvasWidth - 4), y: Math.max(4, canvasHeight - 4) },
       { x: 4, y: Math.max(4, canvasHeight - 4) }
     ];
-    const data = exportarPlanoJSON(points, activeRacks);
+    const data = exportarPlanoJSON(points, activeRacks, editMode ? structureDraft : structures);
     const url = URL.createObjectURL(new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' }));
     const link = document.createElement('a');
     link.href = url;
@@ -1744,7 +1867,23 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
   const importPlan = async (file: File) => {
     try {
       const plan = cargarPlanoJSON(await file.text());
-      savePerimeter(plan.perimeter.map(([x, y]) => ({ x, y })), 'Perímetro importado; guarda el plano para aplicarlo al almacén.');
+      if (!plan.structures.every((structure) => isRackWithinPerimeter(structure, plan.perimeter.map(([x, y]) => ({ x, y }))) ||
+        plan.perimeter.length < 3)) {
+        window.alert('Las paredes y puertas importadas deben quedar dentro del perímetro.');
+        return;
+      }
+      if (activeRacks.some((rack) => rackOverlapsStructures({
+        x: number(rack.map_x), y: number(rack.map_y),
+        width: number(rack.map_width), height: number(rack.map_height)
+      }, plan.structures))) {
+        window.alert('Una estantería se solapa con una pared o puerta del plano importado.');
+        return;
+      }
+      savePerimeter(
+        plan.perimeter.map(([x, y]) => ({ x, y })),
+        'Perímetro, paredes y puertas importados; guarda el plano para aplicarlos al almacén.',
+        plan.structures
+      );
     } catch (reason) {
       window.alert(reason instanceof Error ? reason.message : 'No se pudo importar el plano.');
     } finally {
@@ -1767,7 +1906,8 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
       map_x: Math.max(0, Math.min(rackWizard.x, number(warehouseDraft.map_width) - width)),
       map_y: Math.max(0, Math.min(rackWizard.y, number(warehouseDraft.map_height) - height)),
       map_width: width, map_height: height, level_count: values.levelHeights.length,
-      bins_per_level: values.binsPerLevel, bin_count: values.levelHeights.length * values.binsPerLevel,
+      bins_per_level: values.binsPerLevel, depth_slots: values.depthSlots,
+      bin_count: values.levelHeights.length * values.binsPerLevel * values.depthSlots,
       level_heights: values.levelHeights, units: 0
     };
     if (!isRackWithinPerimeter({
@@ -1775,6 +1915,13 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
       width: number(rack.map_width), height: number(rack.map_height)
     }, perimeter)) {
       window.alert('La estantería debe quedar completamente dentro del perímetro del almacén.');
+      return;
+    }
+    if (rackOverlapsStructures({
+      x: number(rack.map_x), y: number(rack.map_y),
+      width: number(rack.map_width), height: number(rack.map_height)
+    }, structureDraft)) {
+      window.alert('La estantería no puede solaparse con una pared o puerta.');
       return;
     }
     setRackDraft((current) => [...current, rack]);
@@ -1790,6 +1937,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
   };
 
   const activeRacks: Rack[] = editMode ? rackDraft : racks;
+  const activeStructures = editMode ? structureDraft : structures;
   const canvasWidth = number(editMode ? warehouseDraft.map_width : warehouse.map_width);
   const canvasHeight = number(editMode ? warehouseDraft.map_height : warehouse.map_height);
   useEffect(() => {
@@ -1813,6 +1961,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
   const zoomedWidth = Math.round(canvasWidth * MAP_RENDER_SCALE * zoom);
   const zoomedHeight = Math.round(canvasHeight * MAP_RENDER_SCALE * zoom);
   const startPerimeterEdit = () => {
+    setDrawingStructureType(null);
     setPerimeterDraft(perimeter.map((point) => ({ ...point })));
     setDrawingPerimeter(true);
     setEditingPerimeter(perimeter.length > 0);
@@ -1847,7 +1996,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
   return <>
     <PageIntro eyebrow="PLANO CENITAL 2D" title="Mapa del almacén" description="Selecciona una estantería para abrir su visor 3D interactivo." actions={<>
       <button className="button button-secondary" onClick={() => downloadCsv('ubicaciones.csv', [['Ubicación', 'Zona', 'Pasillo', 'Estantería', 'Nivel', 'Unidades'], ...locations.map((location) => [location.code, location.zone, location.aisle, location.rack, location.level_number, location.quantity])])}><Download size={16} /> Exportar CSV</button>
-      {isAdmin && (editMode ? <><button className="button button-secondary" disabled={saving} onClick={discardChanges}>Descartar cambios</button><button className="button button-primary" disabled={saving || drawingPerimeter} title={drawingPerimeter ? 'Finaliza o descarta la edición del perímetro' : undefined} onClick={() => void saveLayout()}><Check size={16} /> {saving ? 'Guardando…' : 'Guardar y salir'}</button></> : <button className="button button-primary" onClick={startEditing}><Pencil size={15} /> Editar plano</button>)}
+      {isAdmin && (editMode ? <><button className="button button-secondary" disabled={saving} onClick={discardChanges}>Descartar cambios</button><button className="button button-primary" disabled={saving || drawingPerimeter || drawingStructureType !== null} title={drawingPerimeter || drawingStructureType ? 'Finaliza o cancela el dibujo activo' : undefined} onClick={() => void saveLayout()}><Check size={16} /> {saving ? 'Guardando…' : 'Guardar y salir'}</button></> : <button className="button button-primary" onClick={startEditing}><Pencil size={15} /> Editar plano</button>)}
     </>} />
     <div className="map-summary"><div className="map-summary-item"><span className="map-dot occupied" />Ubicaciones ocupadas <strong>{occupied}</strong></div><div className="map-summary-item"><span className="map-dot available" />Vacías <strong>{locations.length - occupied}</strong></div><div className="map-summary-item"><Layers size={14} />Estanterías <strong>{activeRacks.length}</strong></div><div className="map-summary-spacer" /><div className="map-floor"><Building2 size={15} /> {warehouse.name}</div></div>
     <div className="map-layout">
@@ -1855,7 +2004,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
         <div className="warehouse-dimensions"><label>Ancho (cm)<input type="number" min="520" max="30000" step="50" value={number(warehouseDraft.map_width)} onChange={(event) => setWarehouseDraft((current) => ({ ...current, map_width: Number(event.target.value) }))} /></label><label>Fondo (cm)<input type="number" min="340" max="30000" step="50" value={number(warehouseDraft.map_height)} onChange={(event) => setWarehouseDraft((current) => ({ ...current, map_height: Number(event.target.value) }))} /></label></div>
         <div className="perimeter-tools">
           {!drawingPerimeter
-            ? <button className="button button-secondary full-button" onClick={startPerimeterEdit}>{perimeter.length ? 'Editar perímetro' : 'Dibujar perímetro'}</button>
+            ? <button className="button button-secondary full-button" disabled={drawingStructureType !== null} onClick={startPerimeterEdit}>{perimeter.length ? 'Editar perímetro' : 'Dibujar perímetro'}</button>
             : <>
               <span className="map-tool-hint">{editingPerimeter ? 'Arrastra los vértices para moverlos o pulsa para añadir otro.' : 'Haz clic para añadir vértices y pulsa el primero para cerrar.'} Los puntos se ajustan a la cuadrícula (1 m); las líneas pueden ser diagonales.</span>
               <button className="button button-primary full-button" onClick={finishPerimeter}>Finalizar plano</button>
@@ -1866,12 +2015,20 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
           <button className="button button-secondary full-button" onClick={() => perimeterFileRef.current?.click()}><Upload size={14} /> Cargar plano JSON</button>
           <input ref={perimeterFileRef} className="perimeter-file-input" type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (file) void importPlan(file); }} />
         </div>
+        <div className="perimeter-tools">
+          <strong className="map-tool-hint">Paredes y puertas interiores</strong>
+          <button className={`button ${drawingStructureType === 'wall' ? 'button-primary' : 'button-secondary'} full-button`} disabled={drawingPerimeter} onClick={() => setStructureDrawingMode('wall')}>{drawingStructureType === 'wall' ? 'Finalizar paredes' : 'Dibujar pared'}</button>
+          <button className={`button ${drawingStructureType === 'door' ? 'button-primary' : 'button-secondary'} full-button`} disabled={drawingPerimeter} onClick={() => setStructureDrawingMode('door')}>{drawingStructureType === 'door' ? 'Finalizar puertas' : 'Marcar puerta'}</button>
+          {drawingStructureType && <span className="map-tool-hint">Arrastra en el plano para dibujar un tramo horizontal o vertical de al menos 1 m. Dibuja la pared en segmentos y deja el hueco para la puerta.</span>}
+          {selectedStructureId && !drawingStructureType && <button className="button button-danger full-button" onClick={removeSelectedStructure}><Trash2 size={14} /> Eliminar {structureDraft.find((structure) => structure.id === selectedStructureId)?.type === 'door' ? 'puerta' : 'pared'}</button>}
+        </div>
         <div className="map-tool-hint">El perímetro se guarda junto al plano del almacén; las estanterías siguen gestionándose con el flujo actual.</div>
         <div className="map-tool-hint">Arrastra estanterías para moverlas y usa el tirador de la esquina inferior derecha para cambiar su tamaño. No pueden salir del perímetro.</div>
         <div className="map-tool-hint">Ajuste magnético activo: posiciones y tamaños se alinean a la cuadrícula de 1 m.</div>
         <div className="rack-template" draggable onDragStart={(event) => event.dataTransfer.setData('application/stockflow-map-element', 'rack')}><div className="rack-template-icon"><Layers size={19} /></div><span><strong>Estantería</strong><small>Añadir directamente al plano</small></span><Plus size={16} /></div>
         <button className="button button-secondary full-button rack-create-button" onClick={() => openRackWizard()}><Plus size={15} /> Añadir estantería</button>
         <div className="map-tool-note"><ShieldCheck size={14} /> Las estanterías quedan dentro del perímetro del almacén.</div>
+        <div className="map-tool-note"><ShieldCheck size={14} /> Las estanterías no pueden solaparse con paredes ni puertas.</div>
       </aside>}
       <section className="panel map-panel"><div className="map-panel-heading"><div><h2>{warehouse.name}</h2><p>{activeRacks.length} estanterías <span>·</span> {locations.length} ubicaciones</p></div><div className="zoom-controls"><button aria-label="Alejar" title="Alejar" onClick={() => setZoom((value) => Math.max(.05, Math.round((value - .1) * 100) / 100))}><ZoomOut size={15} /></button><span>{Math.round(zoom * 100)}%</span><button aria-label="Acercar" title="Acercar" onClick={() => setZoom((value) => Math.min(1.6, Math.round((value + .1) * 100) / 100))}><ZoomIn size={15} /></button></div></div>
         <div ref={mapViewportRef} className="map-canvas-wrap">
@@ -1882,14 +2039,17 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
               zoom={zoom}
               racks={activeRacks}
               locations={locations}
+              structures={activeStructures}
               selectedRackId={selectedRackId}
+              selectedStructureId={selectedStructureId}
               editing={editMode && isAdmin}
+              drawingStructureType={drawingStructureType}
               perimeter={perimeter}
               perimeterDraft={perimeterDraft}
               drawingPerimeter={drawingPerimeter}
               editingPerimeter={editingPerimeter}
               canvasRef={canvasRef}
-              onSelectRack={(rackId) => { setSelectedRackId(rackId); onSelect(null); }}
+              onSelectRack={(rackId) => { setSelectedRackId(rackId); setSelectedStructureId(null); onSelect(null); }}
               onMoveRack={(rackId, x, y) => {
                 const rack = activeRacks.find((item) => item.id === rackId);
                 if (!rack) return;
@@ -1898,6 +2058,9 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
                 if (!isRackWithinPerimeter({
                   x: nextX, y: nextY, width: number(rack.map_width), height: number(rack.map_height)
                 }, perimeter)) return;
+                if (rackOverlapsStructures({
+                  x: nextX, y: nextY, width: number(rack.map_width), height: number(rack.map_height)
+                }, activeStructures)) return;
                 updateRack(rackId, 'map_x', nextX);
                 updateRack(rackId, 'map_y', nextY);
               }}
@@ -1909,6 +2072,9 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
                 if (!isRackWithinPerimeter({
                   x: number(rack.map_x), y: number(rack.map_y), width: nextWidth, height: nextHeight
                 }, perimeter)) return;
+                if (rackOverlapsStructures({
+                  x: number(rack.map_x), y: number(rack.map_y), width: nextWidth, height: nextHeight
+                }, activeStructures)) return;
                 updateRack(rackId, 'map_width', nextWidth);
                 updateRack(rackId, 'map_height', nextHeight);
               }}
@@ -1922,6 +2088,12 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
                 }, next)) ? next : points;
               })}
               onFinishPerimeter={finishPerimeter}
+              onAddStructure={addStructure}
+              onSelectStructure={(structureId) => {
+                setSelectedStructureId(structureId);
+                setSelectedRackId(null);
+                onSelect(null);
+              }}
             />
           </div>
         </div>

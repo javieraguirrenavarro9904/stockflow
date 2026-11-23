@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS warehouses (
   map_width NUMERIC(7, 2) NOT NULL DEFAULT 5000 CHECK (map_width BETWEEN 520 AND 30000),
   map_height NUMERIC(7, 2) NOT NULL DEFAULT 3000 CHECK (map_height BETWEEN 340 AND 30000),
   map_perimeter JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(map_perimeter) = 'array'),
+  map_structures JSONB NOT NULL DEFAULT '[]'::jsonb CHECK (jsonb_typeof(map_structures) = 'array'),
   timezone TEXT NOT NULL DEFAULT 'Europe/Madrid',
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -67,6 +68,7 @@ CREATE TABLE IF NOT EXISTS racks (
   map_y NUMERIC(7, 2) NOT NULL DEFAULT 30,
   map_width NUMERIC(7, 2) NOT NULL DEFAULT 480 CHECK (map_width BETWEEN 160 AND 2000),
   map_height NUMERIC(7, 2) NOT NULL DEFAULT 280 CHECK (map_height BETWEEN 100 AND 1200),
+  depth_slots SMALLINT NOT NULL DEFAULT 1 CHECK (depth_slots BETWEEN 1 AND 12),
   UNIQUE (aisle_id, code)
 );
 
@@ -90,6 +92,7 @@ CREATE TABLE IF NOT EXISTS bins (
   map_height NUMERIC(7, 2) NOT NULL DEFAULT 64,
   display_name TEXT,
   width_units SMALLINT NOT NULL DEFAULT 1 CHECK (width_units BETWEEN 1 AND 12),
+  depth_position SMALLINT NOT NULL DEFAULT 1 CHECK (depth_position BETWEEN 1 AND 12),
   merged_into_bin_id UUID REFERENCES bins(id) ON DELETE SET NULL,
   CONSTRAINT bins_merged_into_not_self CHECK (merged_into_bin_id IS NULL OR merged_into_bin_id <> id),
   CONSTRAINT bins_merged_children_single_unit CHECK (merged_into_bin_id IS NULL OR width_units = 1),

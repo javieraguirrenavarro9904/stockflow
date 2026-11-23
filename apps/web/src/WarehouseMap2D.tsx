@@ -1,5 +1,8 @@
 import { useId, useRef, useState, type DragEvent, type KeyboardEvent, type PointerEvent as ReactPointerEvent, type RefObject } from 'react';
-import { MAP_GRID_SIZE, MAP_RENDER_SCALE, type WarehousePoint } from './warehousePlan';
+import {
+  createWarehouseStructure, MAP_GRID_SIZE, MAP_RENDER_SCALE,
+  type WarehousePoint, type WarehouseStructure
+} from './warehousePlan';
 
 type MapRack = {
   id: string;
@@ -25,6 +28,9 @@ type Props = {
   perimeterDraft: WarehousePoint[];
   drawingPerimeter: boolean;
   editingPerimeter: boolean;
+  structures: WarehouseStructure[];
+  drawingStructureType: WarehouseStructure['type'] | null;
+  selectedStructureId: string | null;
   canvasRef: RefObject<HTMLDivElement>;
   onSelectRack: (rackId: string) => void;
   onMoveRack: (rackId: string, x: number, y: number) => void;
@@ -33,15 +39,21 @@ type Props = {
   onAddPerimeterPoint: (point: WarehousePoint) => void;
   onMovePerimeterPoint: (index: number, point: WarehousePoint) => void;
   onFinishPerimeter: () => void;
+  onAddStructure: (structure: WarehouseStructure) => void;
+  onSelectStructure: (structureId: string) => void;
 };
 
 const value = (input: string | number) => Number(input) || 0;
 const handleHitDistance = 140;
+const createStructureId = () => typeof crypto.randomUUID === 'function'
+  ? crypto.randomUUID()
+  : `structure-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
 export default function WarehouseMap2D({
   width, height, zoom, racks, locations, selectedRackId, editing,
-  perimeter, perimeterDraft, drawingPerimeter, editingPerimeter, canvasRef,
-  onSelectRack, onMoveRack, onResizeRack, onDropRack, onAddPerimeterPoint, onMovePerimeterPoint, onFinishPerimeter
+  perimeter, perimeterDraft, drawingPerimeter, editingPerimeter, structures, drawingStructureType, selectedStructureId, canvasRef,
+  onSelectRack, onMoveRack, onResizeRack, onDropRack, onAddPerimeterPoint, onMovePerimeterPoint, onFinishPerimeter,
+  onAddStructure, onSelectStructure
 }: Props) {
   const drag = useRef<
     | { type: 'moveRack'; id: string; offsetX: number; offsetY: number; moved: boolean }
@@ -49,6 +61,8 @@ export default function WarehouseMap2D({
     | null
   >(null);
   const draggedPerimeterVertex = useRef<number | null>(null);
+  const structureDrag = useRef<{ type: WarehouseStructure['type']; start: WarehousePoint } | null>(null);
+  const [structurePreview, setStructurePreview] = useState<WarehouseStructure | null>(null);
   const [pointerPosition, setPointerPosition] = useState<WarehousePoint | null>(null);
   const gridId = useId().replace(/:/g, '');
 
@@ -73,6 +87,13 @@ export default function WarehouseMap2D({
 
   const pointerDown = (event: ReactPointerEvent<SVGSVGElement>) => {
     const { x, y } = pointFromEvent(event);
+    if (drawingStructureType) {
+      event.preventDefault();
+      structureDrag.current = { type: drawingStructureType, start: snapToGrid({ x, y }) };
+      setStructurePreview(null);
+      event.currentTarget.setPointerCapture(event.pointerId);
+      return;
+    }
     if (drawingPerimeter) {
       event.preventDefault();
       if (editingPerimeter) {
@@ -132,6 +153,11 @@ export default function WarehouseMap2D({
 
   const pointerMove = (event: ReactPointerEvent<SVGSVGElement>) => {
     const point = pointFromEvent(event);
+    if (structureDrag.current) {
+      const { type, start } = structureDrag.current;
+      setStructurePreview(createWarehouseStructure(type, start, snapToGrid(point), 'preview'));
+      return;
+    }
     if (drawingPerimeter) {
       if (draggedPerimeterVertex.current !== null) {
         onMovePerimeterPoint(draggedPerimeterVertex.current, snapToGrid(point));
@@ -173,6 +199,13 @@ export default function WarehouseMap2D({
   };
 
   const pointerUp = (event: ReactPointerEvent<SVGSVGElement>) => {
+    if (structureDrag.current) {
+      const { type, start } = structureDrag.current;
+      const structure = createWarehouseStructure(type, start, snapToGrid(pointFromEvent(event)), createStructureId());
+      if (structure) onAddStructure(structure);
+      structureDrag.current = null;
+      setStructurePreview(null);
+    }
     draggedPerimeterVertex.current = null;
     const currentDrag = drag.current;
     if (currentDrag) {
@@ -229,7 +262,12 @@ export default function WarehouseMap2D({
         onPointerMove={pointerMove}
         onPointerLeave={() => setPointerPosition(null)}
         onPointerUp={pointerUp}
-        onPointerCancel={() => { drag.current = null; draggedPerimeterVertex.current = null; }}
+        onPointerCancel={() => {
+          drag.current = null;
+          draggedPerimeterVertex.current = null;
+          structureDrag.current = null;
+          setStructurePreview(null);
+        }}
         onKeyDown={handleKeyDown}
       >
         <defs>
@@ -270,6 +308,49 @@ export default function WarehouseMap2D({
             />
           ))}
         </>}
+
+        {structures.map((structure) => (
+          <g
+            key={structure.id}
+            style={{ cursor: editing ? 'pointer' : 'default' }}
+            onPointerDown={(event) => {
+              if (!editing || drawingPerimeter || drawingStructureType) return;
+              event.stopPropagation();
+              onSelectStructure(structure.id);
+            }}
+          >
+            <rect
+              x={structure.x}
+              y={structure.y}
+              width={structure.width}
+              height={structure.height}
+              rx="4"
+              fill={structure.type === 'wall' ? '#65736b' : '#f4e3b6'}
+              stroke={selectedStructureId === structure.id ? '#168158' : structure.type === 'wall' ? '#3d4b43' : '#ae7a2c'}
+              strokeWidth={selectedStructureId === structure.id ? 12 : 6}
+            />
+            {structure.type === 'door' && <text
+              x={structure.x + structure.width / 2}
+              y={structure.y + structure.height / 2}
+              fill="#815d24"
+              fontSize="55"
+              fontWeight="700"
+              textAnchor="middle"
+              dominantBaseline="middle"
+            >PUERTA</text>}
+          </g>
+        ))}
+        {structurePreview && <rect
+          x={structurePreview.x}
+          y={structurePreview.y}
+          width={structurePreview.width}
+          height={structurePreview.height}
+          fill={structurePreview.type === 'wall' ? '#65736b99' : '#f4e3b699'}
+          stroke={structurePreview.type === 'wall' ? '#3d4b43' : '#ae7a2c'}
+          strokeWidth="8"
+          strokeDasharray="35 20"
+          pointerEvents="none"
+        />}
 
         {racks.map((rack) => {
           const x = value(rack.map_x);
