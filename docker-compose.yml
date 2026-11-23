@@ -16,7 +16,8 @@ services:
       - ./apps/api/src/db/migrations/005-bin-display-name.sql:/docker-entrypoint-initdb.d/005-bin-display-name.sql:ro
       - ./apps/api/src/db/migrations/006-bin-expectations.sql:/docker-entrypoint-initdb.d/006-bin-expectations.sql:ro
       - ./apps/api/src/db/migrations/007-wide-bins.sql:/docker-entrypoint-initdb.d/007-wide-bins.sql:ro
-      - ./apps/api/src/db/seed.sql:/docker-entrypoint-initdb.d/008-seed.sql:ro
+      - ./apps/api/src/db/migrations/008-employee-movement-alerts.sql:/docker-entrypoint-initdb.d/008-employee-movement-alerts.sql:ro
+      - ./apps/api/src/db/seed.sql:/docker-entrypoint-initdb.d/009-seed.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wms -d wms"]
       interval: 5s

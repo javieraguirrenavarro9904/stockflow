@@ -31,6 +31,7 @@ app.use(express.json());
 type SessionUser = { id: string; name: string; email: string; role: 'admin' | 'employee' };
 const sessionDurationMs = 8 * 60 * 60 * 1000;
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+const registrationAttempts = new Map<string, { count: number; resetAt: number }>();
 
 function hashPassword(password: string): Promise<string> {
   const salt = randomBytes(16);
@@ -129,6 +130,53 @@ app.post('/api/auth/login', async (req, res, next) => {
   }
 });
 
+app.post('/api/auth/register', async (req, res, next) => {
+  const parsed = z.object({
+    name: z.string().trim().min(2).max(120),
+    email: z.string().trim().email().max(254),
+    password: z.string().min(10).max(200),
+    confirmPassword: z.string().min(10).max(200)
+  }).superRefine((data, ctx) => {
+    if (data.password !== data.confirmPassword)
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['confirmPassword'], message: 'Las contraseñas no coinciden' });
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Revisa el nombre, el correo y que las contraseñas coincidan (mínimo 10 caracteres)' });
+
+  const ip = req.ip ?? req.socket.remoteAddress ?? 'unknown';
+  const now = Date.now();
+  const attempts = registrationAttempts.get(ip);
+  if (attempts && attempts.resetAt > now && attempts.count >= 5)
+    return res.status(429).json({ error: 'Se han realizado demasiados registros desde esta conexión. Prueba más tarde.' });
+  const current = attempts && attempts.resetAt > now ? attempts : { count: 0, resetAt: now + 60 * 60 * 1000 };
+  current.count += 1;
+  registrationAttempts.set(ip, current);
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const user = await client.query(`
+      INSERT INTO users (name, email, password_hash, role)
+      VALUES ($1, lower($2), $3, 'employee')
+      RETURNING id, name, email, role
+    `, [parsed.data.name, parsed.data.email, await hashPassword(parsed.data.password)]);
+    const token = randomBytes(32).toString('hex');
+    const expiresAt = new Date(now + sessionDurationMs);
+    await client.query(
+      'INSERT INTO user_sessions (user_id, token_hash, expires_at) VALUES ($1, $2, $3)',
+      [user.rows[0].id, tokenDigest(token), expiresAt]
+    );
+    await client.query('COMMIT');
+    res.status(201).json({ token, expiresAt, user: user.rows[0] });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    if ((error as { code?: string }).code === '23505')
+      return res.status(409).json({ error: 'Ya existe una cuenta con ese correo electrónico' });
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
 app.get('/api/auth/me', requireAuth, (_req, res) => {
   res.json(res.locals.authUser);
 });
@@ -144,6 +192,56 @@ app.post('/api/auth/logout', requireAuth, async (req, res, next) => {
 });
 
 app.use('/api', requireAuth);
+
+app.get('/api/admin/employee-movement-alerts', requireAdmin, async (_req, res, next) => {
+  const adminUser = res.locals.authUser as SessionUser;
+  try {
+    const [alerts, unread] = await Promise.all([
+      pool.query(`
+        SELECT m.id, m.type, m.reference, m.created_at,
+               u.id AS user_id, u.name AS user_name, u.email AS user_email,
+               COALESCE(string_agg(DISTINCT p.name, ', '), 'Movimiento') AS products,
+               COALESCE(sum(ml.quantity), 0)::numeric AS units,
+               (reads.movement_id IS NULL) AS unread
+        FROM employee_movement_alerts alerts
+        JOIN movements m ON m.id = alerts.movement_id
+        JOIN users u ON u.id = m.created_by
+        LEFT JOIN movement_lines ml ON ml.movement_id = m.id
+        LEFT JOIN products p ON p.id = ml.product_id
+        LEFT JOIN employee_movement_alert_reads reads
+          ON reads.movement_id = m.id AND reads.admin_user_id = $1
+        GROUP BY m.id, u.id, reads.movement_id
+        ORDER BY m.created_at DESC
+        LIMIT 100
+      `, [adminUser.id]),
+      pool.query(`
+        SELECT count(*)::int AS count
+        FROM employee_movement_alerts alerts
+        JOIN movements m ON m.id = alerts.movement_id
+        LEFT JOIN employee_movement_alert_reads reads
+          ON reads.movement_id = m.id AND reads.admin_user_id = $1
+        WHERE reads.movement_id IS NULL
+      `, [adminUser.id])
+    ]);
+    res.json({ alerts: alerts.rows, unreadCount: unread.rows[0].count });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post('/api/admin/employee-movement-alerts/read', requireAdmin, async (_req, res, next) => {
+  const adminUser = res.locals.authUser as SessionUser;
+  try {
+    await pool.query(`
+      INSERT INTO employee_movement_alert_reads (admin_user_id, movement_id)
+      SELECT $1, movement_id FROM employee_movement_alerts
+      ON CONFLICT (admin_user_id, movement_id) DO NOTHING
+    `, [adminUser.id]);
+    res.json({ markedRead: true });
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.get('/api/warehouses', async (_req, res, next) => {
   try {
@@ -1048,19 +1146,11 @@ app.put('/api/locations/:id/expected-content', requireAdmin, async (req, res, ne
 });
 
 const binWidthSchema = z.object({
-  widthUnits: z.coerce.number().int().min(1).max(12)
+  widthUnits: z.coerce.number().int().min(1).max(4)
 });
 
-app.put('/api/locations/:id/width', requireAdmin, async (req, res, next) => {
-  const parsedId = z.string().uuid().safeParse(req.params.id);
-  const parsed = binWidthSchema.safeParse(req.body);
-  if (!parsedId.success) return res.status(400).json({ error: 'Identificador de ubicación no válido' });
-  if (!parsed.success) return res.status(400).json({ error: 'Tamaño de ubicación no válido' });
-  const warehouseId = res.locals.warehouseId as string;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    const selected = await client.query(`
+async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: string, widthUnits: number) {
+  const selected = await client.query(`
       SELECT b.id, b.rack_level_id, b.width_units, b.merged_into_bin_id, b.status,
              r.map_width AS rack_map_width,
              (SELECT count(*)::int FROM bins level_bins WHERE level_bins.rack_level_id = b.rack_level_id) AS slots_per_level,
@@ -1072,57 +1162,73 @@ app.put('/api/locations/:id/width', requireAdmin, async (req, res, next) => {
       JOIN zones z ON z.id = a.zone_id
       WHERE b.id = $1 AND z.warehouse_id = $2
       FOR UPDATE OF b
-    `, [parsedId.data, warehouseId]);
-    if (!selected.rowCount)
-      throw Object.assign(new Error('La ubicación no pertenece al almacén activo'), { status: 404 });
-    const anchor = selected.rows[0] as {
+    `, [binId, warehouseId]);
+  if (!selected.rowCount)
+    throw Object.assign(new Error('La ubicación no pertenece al almacén activo'), { status: 404 });
+  const anchor = selected.rows[0] as {
       id: string; rack_level_id: string; width_units: number; merged_into_bin_id: string | null;
       status: string; slot_position: number; rack_map_width: number; slots_per_level: number
     };
-    if (anchor.merged_into_bin_id)
-      throw Object.assign(new Error('Selecciona el hueco principal de la caja grande para cambiar su tamaño'), { status: 409 });
-    if (anchor.status !== 'active')
-      throw Object.assign(new Error('No se puede cambiar el tamaño de una ubicación bloqueada'), { status: 409 });
+  if (anchor.merged_into_bin_id)
+    throw Object.assign(new Error('Selecciona un hueco principal para crear la caja'), { status: 409 });
+  if (anchor.status !== 'active')
+    throw Object.assign(new Error('No se puede cambiar el tamaño de una ubicación bloqueada'), { status: 409 });
 
-    const slots = await client.query(`
+  const slots = await client.query(`
       SELECT b.id, b.width_units, b.merged_into_bin_id, b.status,
              substring(b.code from '-([0-9]+)$')::int AS slot_position
       FROM bins b WHERE b.rack_level_id = $1 ORDER BY b.code FOR UPDATE
     `, [anchor.rack_level_id]);
-    const targetPositions = Array.from({ length: parsed.data.widthUnits }, (_value, index) => anchor.slot_position + index);
-    const targetSlots = targetPositions.map((position) => slots.rows.find((slot) => slot.slot_position === position));
-    if (targetSlots.some((slot) => !slot))
-      throw Object.assign(new Error('No hay suficientes huecos contiguos a la derecha para ese tamaño'), { status: 400 });
-    const resolvedSlots = targetSlots as { id: string; width_units: number; merged_into_bin_id: string | null; status: string; slot_position: number }[];
-    if (resolvedSlots.some((slot) => slot.merged_into_bin_id && slot.merged_into_bin_id !== anchor.id))
-      throw Object.assign(new Error('El tamaño solicitado se solapa con otra caja grande'), { status: 409 });
-    if (resolvedSlots.some((slot) => slot.status !== 'active'))
-      throw Object.assign(new Error('No se puede combinar con ubicaciones bloqueadas'), { status: 409 });
+  const targetPositions = Array.from({ length: widthUnits }, (_value, index) => anchor.slot_position + index);
+  const targetSlots = targetPositions.map((position) => slots.rows.find((slot) => slot.slot_position === position));
+  if (targetSlots.some((slot) => !slot))
+    throw Object.assign(new Error('No hay suficientes huecos contiguos a la derecha para ese tamaño'), { status: 400 });
+  const resolvedSlots = targetSlots as { id: string; width_units: number; merged_into_bin_id: string | null; status: string; slot_position: number }[];
+  if (resolvedSlots.some((slot) => slot.merged_into_bin_id && slot.merged_into_bin_id !== anchor.id))
+    throw Object.assign(new Error('El tamaño solicitado se solapa con otra caja grande'), { status: 409 });
+  if (resolvedSlots.some((slot) => slot.status !== 'active'))
+    throw Object.assign(new Error('No se puede combinar con ubicaciones bloqueadas'), { status: 409 });
 
-    const targetIds = resolvedSlots.map((slot) => slot.id);
-    const occupied = await client.query(
-      'SELECT id FROM stock_balances WHERE bin_id = ANY($1::uuid[]) AND (quantity > 0 OR reserved_quantity > 0) FOR UPDATE',
-      [targetIds]
-    );
-    if (occupied.rowCount)
-      throw Object.assign(new Error('Vacía todas las ubicaciones afectadas antes de cambiar el tamaño de la caja'), { status: 409 });
-    const planned = await client.query(
-      'SELECT bin_id FROM bin_expectations WHERE bin_id = ANY($1::uuid[]) FOR UPDATE',
-      [targetIds]
-    );
-    if (planned.rowCount)
-      throw Object.assign(new Error('Quita primero el contenido esperado de las ubicaciones afectadas'), { status: 409 });
+  const affectedIds = new Set([
+    ...resolvedSlots.map((slot) => slot.id),
+    ...slots.rows.filter((slot) => slot.merged_into_bin_id === anchor.id).map((slot) => slot.id)
+  ]);
+  const affectedBinIds = [...affectedIds];
+  const occupied = await client.query(
+    'SELECT id FROM stock_balances WHERE bin_id = ANY($1::uuid[]) AND (quantity > 0 OR reserved_quantity > 0) FOR UPDATE',
+    [affectedBinIds]
+  );
+  if (occupied.rowCount)
+    throw Object.assign(new Error('Vacía todas las ubicaciones afectadas antes de cambiar el tamaño de la caja'), { status: 409 });
+  const planned = await client.query(
+    'SELECT bin_id FROM bin_expectations WHERE bin_id = ANY($1::uuid[]) FOR UPDATE',
+    [affectedBinIds]
+  );
+  if (planned.rowCount)
+    throw Object.assign(new Error('Quita primero el contenido esperado de las ubicaciones afectadas'), { status: 409 });
 
-    await client.query(
-      'UPDATE bins SET merged_into_bin_id = NULL, width_units = 1 WHERE merged_into_bin_id = $1',
-      [anchor.id]
-    );
-    const childIds = targetIds.filter((id) => id !== anchor.id);
-    if (childIds.length)
-      await client.query('UPDATE bins SET merged_into_bin_id = $1 WHERE id = ANY($2::uuid[])', [anchor.id, childIds]);
-    const moduleWidth = Math.max(32, Math.floor((Number(anchor.rack_map_width) - 44) / Number(anchor.slots_per_level)) - 6);
-    const mapWidth = moduleWidth * parsed.data.widthUnits + 6 * (parsed.data.widthUnits - 1);
-    await client.query('UPDATE bins SET width_units = $1, map_width = $2 WHERE id = $3', [parsed.data.widthUnits, mapWidth, anchor.id]);
+  await client.query(
+    'UPDATE bins SET merged_into_bin_id = NULL, width_units = 1 WHERE merged_into_bin_id = $1',
+    [anchor.id]
+  );
+  const childIds = resolvedSlots.filter((slot) => slot.id !== anchor.id).map((slot) => slot.id);
+  if (childIds.length)
+    await client.query('UPDATE bins SET merged_into_bin_id = $1 WHERE id = ANY($2::uuid[])', [anchor.id, childIds]);
+  const moduleWidth = Math.max(32, Math.floor((Number(anchor.rack_map_width) - 44) / Number(anchor.slots_per_level)) - 6);
+  const mapWidth = moduleWidth * widthUnits + 6 * (widthUnits - 1);
+  await client.query('UPDATE bins SET width_units = $1, map_width = $2 WHERE id = $3', [widthUnits, mapWidth, anchor.id]);
+}
+
+app.put('/api/locations/:id/width', requireAdmin, async (req, res, next) => {
+  const parsedId = z.string().uuid().safeParse(req.params.id);
+  const parsed = binWidthSchema.safeParse(req.body);
+  if (!parsedId.success) return res.status(400).json({ error: 'Identificador de ubicación no válido' });
+  if (!parsed.success) return res.status(400).json({ error: 'Tamaño de caja no válido. Elige entre 1 y 4 huecos.' });
+  const warehouseId = res.locals.warehouseId as string;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await setBinWidth(client, parsedId.data, warehouseId, parsed.data.widthUnits);
     await client.query('COMMIT');
     res.json({ saved: true, widthUnits: parsed.data.widthUnits });
   } catch (error) {
@@ -1545,6 +1651,7 @@ const movementSchema = z.object({
   fromBinId: z.string().uuid().optional(),
   toBinId: z.string().uuid().optional(),
   binName: z.string().trim().min(1).max(100).optional(),
+  binWidthUnits: z.coerce.number().int().min(1).max(4).optional(),
   destinationWarehouseId: z.string().uuid().optional(),
   reference: z.string().trim().max(120).optional()
 }).superRefine((data, ctx) => {
@@ -1562,6 +1669,8 @@ const movementSchema = z.object({
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['toBinId'], message: 'Una salida solo debe tener ubicación de origen' });
   if (data.binName && !data.toBinId)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['binName'], message: 'El nombre de la caja requiere una ubicación de destino' });
+  if (data.binWidthUnits !== undefined && !data.toBinId)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['binWidthUnits'], message: 'El tamaño de caja requiere una ubicación de destino' });
   if (data.expiresAt && !data.lotCode)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['lotCode'], message: 'Indica el código de lote para guardar su caducidad' });
   if (data.fromBinId && data.fromBinId === data.toBinId)
@@ -1601,7 +1710,7 @@ app.post('/api/movements', async (req, res, next) => {
       JOIN racks r ON r.id = rl.rack_id JOIN aisles a ON a.id = r.aisle_id
       JOIN zones z ON z.id = a.zone_id
       WHERE b.id = ANY($1::uuid[])
-      ${input.binName ? 'FOR UPDATE OF b' : 'FOR SHARE OF b'}
+      ${input.binName || input.binWidthUnits !== undefined ? 'FOR UPDATE OF b' : 'FOR SHARE OF b'}
     `, [requestedBins]) : { rows: [] as { id: string; warehouse_id: string; status: string }[], rowCount: 0 };
     const binById = new Map(binWarehouses.rows.map((bin) => [bin.id, bin]));
     if (requestedBins.some((id) => binById.get(id)?.merged_into_bin_id))
@@ -1612,6 +1721,8 @@ app.post('/api/movements', async (req, res, next) => {
       throw Object.assign(new Error('La ubicación de destino no pertenece al almacén indicado'), { status: 400 });
     if (requestedBins.some((id) => binById.get(id)?.status !== 'active'))
       throw Object.assign(new Error('No se puede mover mercancía a una ubicación bloqueada'), { status: 409 });
+    if (input.binWidthUnits !== undefined && destinationBin)
+      await setBinWidth(client, destinationBin, destinationWarehouseId, input.binWidthUnits);
     if (input.binName && destinationBin) {
       const destinationStock = await client.query(
         'SELECT id FROM stock_balances WHERE bin_id = $1 AND quantity > 0 FOR UPDATE',
@@ -2454,6 +2565,10 @@ async function start() {
     ));
     await pool.query(readFileSync(
       resolve(apiRoot, 'src/db/migrations/007-wide-bins.sql'),
+      'utf8'
+    ));
+    await pool.query(readFileSync(
+      resolve(apiRoot, 'src/db/migrations/008-employee-movement-alerts.sql'),
       'utf8'
     ));
     await pool.query(`

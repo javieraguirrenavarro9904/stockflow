@@ -162,6 +162,18 @@ CREATE TABLE IF NOT EXISTS movements (
   posted_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
+CREATE TABLE IF NOT EXISTS employee_movement_alerts (
+  movement_id UUID PRIMARY KEY REFERENCES movements(id) ON DELETE CASCADE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+CREATE TABLE IF NOT EXISTS employee_movement_alert_reads (
+  admin_user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  movement_id UUID NOT NULL REFERENCES employee_movement_alerts(movement_id) ON DELETE CASCADE,
+  read_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  PRIMARY KEY (admin_user_id, movement_id)
+);
+
 CREATE TABLE IF NOT EXISTS movement_lines (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   movement_id UUID NOT NULL REFERENCES movements(id),

@@ -29,6 +29,7 @@ type Props = {
   productId?: string;
   selectableLocationIds?: string[];
   showAllLocations?: boolean;
+  showLocationLabels?: boolean;
 };
 
 const number = (value: string | number) => Number(value) || 0;
@@ -45,7 +46,7 @@ function ResizeCamera() {
   return null;
 }
 
-function RackScene({ rack, locations, selectedId, onSelectProduct, productId, selectableLocationIds, showAllLocations }: Props) {
+function RackScene({ rack, locations, selectedId, onSelectProduct, productId, selectableLocationIds, showAllLocations, showLocationLabels = true }: Props) {
   const width = Math.max(3, rack.bins_per_level * 1.15);
   const depth = 1.35;
   const selectableIds = useMemo(() => new Set(selectableLocationIds ?? locations.map((location) => location.id)), [locations, selectableLocationIds]);
@@ -118,7 +119,7 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
                 emissiveIntensity={isSelected ? 0.25 : isHighlighted ? 0.12 : 0}
               />
             </mesh>
-            <Html position={[x, levelY + 0.78, 0]} center distanceFactor={8} style={{ pointerEvents: 'none', whiteSpace: 'nowrap' }}><span className="rack-bin-name">{location.display_name || location.code}</span></Html>
+            {showLocationLabels && number(location.quantity) > 0 && <Html position={[x, levelY + 0.78, 0]} center distanceFactor={8} style={{ pointerEvents: 'none', whiteSpace: 'nowrap' }}><span className="rack-bin-name">{location.display_name || location.code}</span></Html>}
           </group>
         );
       })}

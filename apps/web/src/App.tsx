@@ -54,6 +54,9 @@ type Movement = {
   id: string; type: string; reference: string | null; products: string;
   units: string | number; created_at: string;
 };
+type EmployeeMovementAlert = Movement & {
+  user_id: string; user_name: string; user_email: string; unread: boolean;
+};
 type Overview = {
   stats: { products: number; units: string | number; locations: number; low_stock: number };
   movements: Movement[];
@@ -159,6 +162,16 @@ export default function App() {
     setUser(result.user);
   };
 
+  const register = async (name: string, email: string, password: string, confirmPassword: string) => {
+    const result = await request<{ token: string; user: AuthUser }>('/auth/register', {
+      method: 'POST',
+      body: JSON.stringify({ name, email, password, confirmPassword })
+    });
+    authToken = result.token;
+    sessionStorage.setItem('stockflow.session', result.token);
+    setUser(result.user);
+  };
+
   const signOut = async () => {
     try { await request('/auth/logout', { method: 'POST' }); }
     catch (reason) { console.error('No se pudo revocar la sesión en el servidor:', reason); }
@@ -170,7 +183,7 @@ export default function App() {
   };
 
   if (checkingSession) return <div className="auth-loading">Comprobando sesión segura…</div>;
-  if (!user) return <LoginPage onLogin={signIn} />;
+  if (!user) return <LoginPage onLogin={signIn} onRegister={register} />;
   return <WmsApp user={user} onSignOut={() => void signOut()} />;
 }
 
@@ -189,6 +202,8 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
   const [aisles, setAisles] = useState<Aisle[]>([]);
   const [users, setUsers] = useState<UserEntry[]>([]);
   const [movements, setMovements] = useState<Movement[]>([]);
+  const [employeeMovementAlerts, setEmployeeMovementAlerts] = useState<EmployeeMovementAlert[]>([]);
+  const [unreadEmployeeMovementAlerts, setUnreadEmployeeMovementAlerts] = useState(0);
   const [replenishment, setReplenishment] = useState<ReplenishmentItem[]>([]);
   const [purchaseOrders, setPurchaseOrders] = useState<PurchaseOrder[]>([]);
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([]);
@@ -253,6 +268,28 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
+
+  useEffect(() => {
+    if (!isAdmin) return;
+    let active = true;
+    const loadAlerts = () => {
+      void request<{ alerts: EmployeeMovementAlert[]; unreadCount: number }>('/admin/employee-movement-alerts')
+        .then((result) => {
+          if (!active) return;
+          setEmployeeMovementAlerts(result.alerts);
+          setUnreadEmployeeMovementAlerts(result.unreadCount);
+        })
+        .catch((reason) => {
+          if (active) setError(reason instanceof Error ? reason.message : 'No se pudieron cargar las alertas de movimientos');
+        });
+    };
+    loadAlerts();
+    const intervalId = window.setInterval(loadAlerts, 30000);
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [isAdmin]);
 
   useEffect(() => {
     if (loading || error || deepLinkHandledRef.current) return;
@@ -410,6 +447,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
       type, productId: form.get('productId'), quantity: Number(form.get('quantity')),
       lotCode: lotCode || undefined, expiresAt: expiresAt || undefined,
       binName: form.get('binName') || undefined,
+      binWidthUnits: form.get('binWidthUnits') ? Number(form.get('binWidthUnits')) : undefined,
       reference: form.get('reference') || undefined,
       destinationWarehouseId: type === 'transfer' ? form.get('destinationWarehouseId') : undefined
     };
@@ -444,21 +482,6 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
       return true;
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'No se pudo actualizar el contenido esperado');
-      return false;
-    }
-  };
-
-  const saveLocationWidth = async (locationId: string, widthUnits: number): Promise<boolean> => {
-    try {
-      await request(`/locations/${locationId}/width`, {
-        method: 'PUT',
-        body: JSON.stringify({ widthUnits })
-      });
-      await refresh();
-      notify('Tamaño de caja actualizado');
-      return true;
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'No se pudo cambiar el tamaño de la caja');
       return false;
     }
   };
@@ -614,7 +637,19 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
     }
   };
 
+  const markEmployeeAlertsRead = async () => {
+    try {
+      await request('/admin/employee-movement-alerts/read', { method: 'POST' });
+      setEmployeeMovementAlerts((current) => current.map((alert) => ({ ...alert, unread: false })));
+      setUnreadEmployeeMovementAlerts(0);
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'No se pudieron marcar las alertas como leídas');
+    }
+  };
+
   const pageTitle = page === 'settings' ? 'Configuración' : navItems.find((item) => item.id === page)?.label ?? 'Resumen';
+  const operationalAlertCount = (overview?.lowStock.length ?? 0) + (overview?.expiring.length ?? 0);
+  const notificationCount = operationalAlertCount + (isAdmin ? unreadEmployeeMovementAlerts : 0);
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
       <aside className="sidebar">
@@ -645,7 +680,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
         <div className="sidebar-bottom">
           <div className="sync-status"><span className="status-pulse" /><div><strong>Sistema operativo</strong><small>Sincronizado ahora</small></div></div>
           <button className={`nav-item ${page === 'settings' ? 'selected' : ''}`} onClick={() => navigateToPage('settings')}><Settings2 size={18} /><span>Configuración</span></button>
-          <button className="profile" onClick={signOutFromEditor} title="Cerrar sesión">
+          <button className="profile" onClick={signOutFromEditor} title="Cerrar sesión para cambiar de cuenta" aria-label="Cerrar sesión para cambiar de cuenta">
             <div className="avatar">{initials(user.name)}</div>
             <div className="profile-copy"><strong>{user.name}</strong><small>{isAdmin ? 'Administrador' : 'Empleado'}</small></div>
             <LogOut size={16} className="muted-icon" />
@@ -661,11 +696,13 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
           </div>
           <div className="top-actions">
             <label className="global-search"><Search size={16} /><input ref={searchInputRef} value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar SKU, producto..." /><kbd><Command size={11} /> K</kbd></label>
-            <div className="notification-wrap"><button className="icon-button notification-button" aria-label="Notificaciones" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen((open) => !open)}><Bell size={18} />{((overview?.lowStock.length ?? 0) + (overview?.expiring.length ?? 0)) > 0 && <i />}</button>
-              {notificationsOpen && <div className="notification-popover"><div className="notification-title"><strong>Notificaciones</strong><span>{(overview?.lowStock.length ?? 0) + (overview?.expiring.length ?? 0)}</span></div>
+            <div className="notification-wrap"><button className="icon-button notification-button" aria-label="Notificaciones" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen((open) => !open)}><Bell size={18} />{notificationCount > 0 && <i />}</button>
+              {notificationsOpen && <div className="notification-popover"><div className="notification-title"><strong>Notificaciones</strong><span>{notificationCount}</span></div>
                 {(overview?.lowStock ?? []).slice(0, 3).map((product) => <button key={product.id} className="notification-item" onClick={() => { setNotificationsOpen(false); navigateToPage('inventory'); }}><span className="notification-alert" /><span><strong>Stock bajo</strong><small>{product.name} · {formatNumber(product.stock)} uds.</small></span><ChevronRight size={14} /></button>)}
                 {(overview?.expiring ?? []).slice(0, 3).map((lot) => <button key={lot.lot_code} className="notification-item" onClick={() => { setNotificationsOpen(false); navigateToPage('inventory'); }}><span className="notification-alert expiry" /><span><strong>Caducidad próxima</strong><small>{lot.name} · {new Date(lot.expires_at).toLocaleDateString('es-ES')}</small></span><ChevronRight size={14} /></button>)}
-                {!overview?.lowStock.length && !overview?.expiring.length && <div className="notification-empty"><ShieldCheck size={17} /> No tienes alertas pendientes</div>}
+                {isAdmin && employeeMovementAlerts.filter((alert) => alert.unread).slice(0, 3).map((alert) => <button key={alert.id} className="notification-item" onClick={() => { setNotificationsOpen(false); navigateToPage('settings'); }}><span className="notification-alert movement" /><span><strong>{movementNames[alert.type] ?? alert.type} · {alert.user_name}</strong><small>{alert.products} · {formatDate(alert.created_at)}</small></span><ChevronRight size={14} /></button>)}
+                {!notificationCount && <div className="notification-empty"><ShieldCheck size={17} /> No tienes alertas pendientes</div>}
+                {isAdmin && <button className="notification-view-all" onClick={() => { setNotificationsOpen(false); navigateToPage('settings'); }}>Ver alertas de movimientos <ChevronRight size={13} /></button>}
               </div>}
             </div>
             <button className="top-avatar top-avatar-button" onClick={() => navigateToPage('settings')} title="Perfil y configuración">{initials(user.name)}</button>
@@ -681,12 +718,12 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
             try { await request(`/products/${id}`, { method: 'DELETE' }); await refresh(); notify('Producto archivado'); }
             catch (reason) { setError(reason instanceof Error ? reason.message : 'No se pudo archivar'); }
           }} />}
-          {page === 'map' && warehouseMap && <MapPage products={products} locations={locations} racks={racks} warehouse={warehouseMap} aisles={aisles} selected={selectedLocation} initialRackId={qrRackId} isAdmin={isAdmin} onSelect={setSelectedLocation} onRefresh={refresh} onNotify={notify} onMoveStock={(location) => { setMovementDefaults({ type: 'transfer', fromBinId: location.id }); setMovementError(''); setModal('movement'); }} onSaveExpected={saveExpectedContent} onSaveLocationWidth={saveLocationWidth} onSaveLocationName={saveLocationName} onEditingChange={setMapEditing} />}
+          {page === 'map' && warehouseMap && <MapPage products={products} locations={locations} racks={racks} warehouse={warehouseMap} aisles={aisles} selected={selectedLocation} initialRackId={qrRackId} isAdmin={isAdmin} onSelect={setSelectedLocation} onRefresh={refresh} onNotify={notify} onMoveStock={(location) => { setMovementDefaults({ type: 'transfer', fromBinId: location.id }); setMovementError(''); setModal('movement'); }} onSaveExpected={saveExpectedContent} onSaveLocationName={saveLocationName} onEditingChange={setMapEditing} />}
           {page === 'movements' && <MovementsPage movements={movements} onAdd={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onExport={() => downloadCsv('movimientos.csv', [['Tipo', 'Referencia', 'Productos', 'Unidades', 'Fecha'], ...movements.map((item) => [movementNames[item.type] ?? item.type, item.reference, item.products, item.units, item.created_at])])} />}
           {page === 'purchasing' && <PurchasingPage suggestions={replenishment} orders={purchaseOrders} locations={locations} isAdmin={isAdmin} onCreateOrder={createPurchaseOrders} onReceiveOrder={receivePurchaseOrder} onCancelOrder={cancelPurchaseOrder} />}
           {page === 'salesOrders' && <SalesOrdersPage orders={salesOrders} products={products} locations={locations} onCreateOrder={createSalesOrder} onStartPicking={(id) => changeSalesOrder(id, 'picking')} onFulfill={(id) => changeSalesOrder(id, 'fulfill')} onCancelOrder={(id) => changeSalesOrder(id, 'cancel')} />}
           {page === 'assistant' && <AssistantPage />}
-          {page === 'settings' && <SettingsPage user={user} users={users} categories={categories} suppliers={suppliers} isAdmin={isAdmin} onAddUser={() => setModal('employee')} onToggleUser={(entry) => void toggleEmployee(entry)} onChangePassword={changePassword} onCreateCatalogEntry={createCatalogEntry} onDeleteCatalogEntry={deleteCatalogEntry} />}
+          {page === 'settings' && <SettingsPage user={user} users={users} categories={categories} suppliers={suppliers} employeeMovementAlerts={employeeMovementAlerts} unreadEmployeeMovementAlerts={unreadEmployeeMovementAlerts} isAdmin={isAdmin} onAddUser={() => setModal('employee')} onToggleUser={(entry) => void toggleEmployee(entry)} onChangePassword={changePassword} onCreateCatalogEntry={createCatalogEntry} onDeleteCatalogEntry={deleteCatalogEntry} onMarkEmployeeAlertsRead={() => void markEmployeeAlertsRead()} />}
         </div>
       </main>
       {modal && <Modal wide={modal === 'movement'} error={modal === 'movement' ? movementError : ''} title={modal === 'product' ? 'Añadir producto' : modal === 'editProduct' ? 'Editar producto' : modal === 'employee' ? 'Crear cuenta de empleado' : modal === 'warehouse' ? 'Añadir almacén' : 'Registrar movimiento'} onClose={() => { setModal(null); setEditingProduct(null); setMovementDefaults(null); setMovementError(''); }}>
@@ -707,39 +744,60 @@ function PageIntro({ eyebrow, title, description, actions }: { eyebrow: string; 
   return <div className="page-intro"><div><div className="eyebrow">{eyebrow}</div><h1>{title}</h1><p>{description}</p></div><div className="intro-actions">{actions}</div></div>;
 }
 
-function LoginPage({ onLogin }: { onLogin: (email: string, password: string) => Promise<void> }) {
-  const [email, setEmail] = useState('admin@stockflow.local');
+function LoginPage({ onLogin, onRegister }: {
+  onLogin: (email: string, password: string) => Promise<void>;
+  onRegister: (name: string, email: string, password: string, confirmPassword: string) => Promise<void>;
+}) {
+  const [email, setEmail] = useState('');
+  const [name, setName] = useState('');
   const [password, setPassword] = useState('');
+  const [confirmPassword, setConfirmPassword] = useState('');
+  const [registering, setRegistering] = useState(false);
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const fromQr = ['rackId', 'locationId'].some((key) => new URLSearchParams(window.location.search).has(key));
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     setError('');
+    if (registering && password !== confirmPassword) {
+      setError('Las contraseñas no coinciden.');
+      return;
+    }
     setBusy(true);
-    try { await onLogin(email, password); }
-    catch (reason) { setError(reason instanceof Error ? reason.message : 'No se pudo iniciar sesión'); }
+    try {
+      if (registering) await onRegister(name, email, password, confirmPassword);
+      else await onLogin(email, password);
+    } catch (reason) { setError(reason instanceof Error ? reason.message : registering ? 'No se pudo crear la cuenta' : 'No se pudo iniciar sesión'); }
     finally { setBusy(false); }
   };
 
   return <main className="login-page"><section className="login-card">
     <div className="login-brand"><div className="brand-mark"><Boxes size={21} /></div><span>stockflow<span className="brand-dot">.</span></span></div>
-    <span className="eyebrow">GESTIÓN INTELIGENTE DE ALMACÉN</span><h1>Bienvenido de nuevo</h1><p className="login-subtitle">Inicia sesión con tu cuenta de administrador o empleado.</p>
+    <span className="eyebrow">{fromQr ? 'ACCESO A UBICACIÓN QR' : 'GESTIÓN INTELIGENTE DE ALMACÉN'}</span><h1>{registering ? 'Crear cuenta de empleado' : 'Bienvenido de nuevo'}</h1><p className="login-subtitle">{registering ? 'Crea tu cuenta para consultar y trabajar en el almacén.' : fromQr ? 'Inicia sesión o crea una cuenta para consultar esta estantería.' : 'Inicia sesión con tu correo y contraseña. El tipo de cuenta determina tus permisos.'}</p>
     <form className="form-grid login-form" onSubmit={(event) => void submit(event)}>
+      {registering && <label>Nombre o apodo<input autoComplete="nickname" required minLength={2} maxLength={120} value={name} onChange={(event) => setName(event.target.value)} placeholder="Cómo te llamamos" /></label>}
       <label>Correo electrónico<input autoComplete="username" type="email" required value={email} onChange={(event) => setEmail(event.target.value)} placeholder="nombre@empresa.com" /></label>
-      <label>Contraseña<input autoComplete="current-password" type="password" required value={password} onChange={(event) => setPassword(event.target.value)} placeholder="Tu contraseña" /></label>
+      <label>Contraseña<input autoComplete={registering ? 'new-password' : 'current-password'} type="password" required minLength={registering ? 10 : undefined} value={password} onChange={(event) => setPassword(event.target.value)} placeholder={registering ? 'Mínimo 10 caracteres' : 'Tu contraseña'} /></label>
+      {registering && <label>Repite la contraseña<input autoComplete="new-password" type="password" required minLength={10} value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} placeholder="Escríbela de nuevo" /></label>}
       {error && <div className="login-error">{error}</div>}
-      <button className="button button-primary login-submit" disabled={busy}>{busy ? 'Validando…' : <><LockKeyhole size={16} /> Iniciar sesión</>}</button>
+      <button className="button button-primary login-submit" disabled={busy}>{busy ? registering ? 'Creando cuenta…' : 'Validando…' : <><LockKeyhole size={16} /> {registering ? 'Crear cuenta de empleado' : 'Iniciar sesión'}</>}</button>
     </form>
-    <div className="demo-accounts"><strong>Cuentas de demostración</strong><button onClick={() => { setEmail('admin@stockflow.local'); setPassword('Stockflow2026!'); }}>Administrador <span>admin@stockflow.local</span></button><button onClick={() => { setEmail('empleado@stockflow.local'); setPassword('Empleado2026!'); }}>Empleado <span>empleado@stockflow.local</span></button><small>Cambia las contraseñas de demostración antes de usar datos reales.</small></div>
+    <button type="button" className="login-mode-switch" onClick={() => { setRegistering((current) => !current); setError(''); setPassword(''); setConfirmPassword(''); }}>
+      {registering ? '¿Ya tienes una cuenta? Iniciar sesión' : '¿No tienes cuenta? Crear cuenta de empleado'}
+    </button>
+    {!registering && <p className="login-admin-hint">Para entrar como administrador, inicia sesión con el correo y la contraseña de una cuenta administradora.</p>}
+    {import.meta.env.DEV && !registering && <div className="demo-accounts"><strong>Cuentas de demostración</strong><button type="button" onClick={() => { setEmail('admin@stockflow.local'); setPassword('Stockflow2026!'); }}>Administrador <span>admin@stockflow.local</span></button><button type="button" onClick={() => { setEmail('empleado@stockflow.local'); setPassword('Empleado2026!'); }}>Empleado <span>empleado@stockflow.local</span></button><small>Cambia las contraseñas de demostración antes de usar datos reales.</small></div>}
   </section></main>;
 }
 
-function SettingsPage({ user, users, categories, suppliers, isAdmin, onAddUser, onToggleUser, onChangePassword, onCreateCatalogEntry, onDeleteCatalogEntry }: {
+function SettingsPage({ user, users, categories, suppliers, employeeMovementAlerts, unreadEmployeeMovementAlerts, isAdmin, onAddUser, onToggleUser, onChangePassword, onCreateCatalogEntry, onDeleteCatalogEntry, onMarkEmployeeAlertsRead }: {
   user: AuthUser; users: UserEntry[]; categories: CatalogOption[]; suppliers: CatalogOption[]; isAdmin: boolean; onAddUser: () => void;
+  employeeMovementAlerts: EmployeeMovementAlert[]; unreadEmployeeMovementAlerts: number;
   onToggleUser: (user: UserEntry) => void; onChangePassword: (event: FormEvent<HTMLFormElement>) => void;
   onCreateCatalogEntry: (kind: 'categories' | 'suppliers', name: string) => Promise<boolean>;
   onDeleteCatalogEntry: (kind: 'categories' | 'suppliers', entry: CatalogOption) => Promise<boolean>;
+  onMarkEmployeeAlertsRead: () => void;
 }) {
   return <>
     <PageIntro eyebrow="CUENTA Y PERMISOS" title="Configuración" description="Gestiona tu sesión y los accesos del equipo al almacén." />
@@ -758,9 +816,29 @@ function SettingsPage({ user, users, categories, suppliers, isAdmin, onAddUser, 
         <div className="team-footnote"><ShieldCheck size={14} /> Desactivar una cuenta cierra también las sesiones abiertas.</div>
       </section>}
       {isAdmin && <CatalogManagement categories={categories} suppliers={suppliers} onCreate={onCreateCatalogEntry} onDelete={onDeleteCatalogEntry} />}
+      {isAdmin && <EmployeeMovementAlerts alerts={employeeMovementAlerts} unreadCount={unreadEmployeeMovementAlerts} onMarkRead={onMarkEmployeeAlertsRead} />}
       {!isAdmin && <section className="panel employee-permissions"><div className="settings-section-title"><Users size={16} /><strong>Permisos del empleado</strong></div><p>Puedes consultar el inventario, registrar movimientos, explorar el mapa y utilizar el asistente. La configuración de productos y estanterías está reservada a administradores.</p></section>}
     </div>
   </>;
+}
+
+function EmployeeMovementAlerts({ alerts, unreadCount, onMarkRead }: {
+  alerts: EmployeeMovementAlert[]; unreadCount: number; onMarkRead: () => void;
+}) {
+  return <section className="panel employee-alerts">
+    <div className="panel-heading"><div><h2>Alertas de movimientos</h2><p>Movimientos registrados por empleados, con autor y fecha.</p></div>
+      {unreadCount > 0 && <button className="button button-secondary" onClick={onMarkRead}>Marcar como leídas ({unreadCount})</button>}
+    </div>
+    {!alerts.length
+      ? <div className="table-empty">Todavía no hay movimientos de empleados.</div>
+      : <div className="employee-alert-list">{alerts.map((alert) => <article className={`employee-alert-row ${alert.unread ? 'unread' : ''}`} key={alert.id}>
+        <span className="employee-alert-type">{movementNames[alert.type] ?? alert.type}</span>
+        <div className="employee-alert-description"><strong>{alert.products}</strong><small>{alert.reference ? `Referencia ${alert.reference} · ` : ''}{formatNumber(alert.units)} uds.</small></div>
+        <div className="employee-alert-user"><strong>{alert.user_name}</strong><small>{alert.user_email}</small></div>
+        <time dateTime={alert.created_at}>{formatDate(alert.created_at)}</time>
+      </article>)}</div>}
+    <div className="team-footnote"><Bell size={14} /> Se actualiza automáticamente cada 30 segundos. Se muestran hasta 100 movimientos.</div>
+  </section>;
 }
 
 function CatalogManagement({ categories, suppliers, onCreate, onDelete }: {
@@ -977,32 +1055,24 @@ function RackCreationForm({ initialAisleId, initialWidth, initialHeight, existin
   </form>;
 }
 
-function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin, editing, saving, onBack, onSelect, onMoveStock, onSaveExpected, onSaveLocationWidth, onSaveLocationName, onChange, onDelete, onSave, onDiscard }: {
+function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin, editing, saving, onBack, onSelect, onMoveStock, onSaveExpected, onSaveLocationName, onChange, onDelete, onSave, onDiscard }: {
   rack: Rack; locations: Location[]; selected: Location | null; products: Product[]; warehouseId: string;
   isAdmin: boolean; editing: boolean; saving: boolean;
   onBack: () => void; onSelect: (location: Location | null) => void;
   onMoveStock: (location: Location) => void;
   onSaveExpected: (locationId: string, expected: { productId: string; quantity: number }[]) => Promise<boolean>;
-  onSaveLocationWidth: (locationId: string, widthUnits: number) => Promise<boolean>;
   onSaveLocationName: (locationId: string, displayName: string | null) => Promise<boolean>;
   onChange: (field: string, value: string | number) => void;
   onDelete: () => void; onSave: () => void; onDiscard: () => void
 }) {
-  const [activeLevel, setActiveLevel] = useState(selected?.level_number ?? rack.level_count);
   const [editingExpectedLocationId, setEditingExpectedLocationId] = useState<string | null>(null);
   const [qrLabelsOpen, setQrLabelsOpen] = useState(false);
-  const [widthSaving, setWidthSaving] = useState(false);
   const [nameSaving, setNameSaving] = useState(false);
   const [displayName, setDisplayName] = useState(selected?.display_name ?? '');
   useEffect(() => {
-    setActiveLevel(selected?.level_number ?? rack.level_count);
     setEditingExpectedLocationId(null);
-  }, [rack.id, rack.level_count, selected?.level_number]);
-  const levels = Array.from({ length: rack.level_count }, (_, index) => index + 1);
-  const levelLocations = locations.filter((location) => location.level_number === activeLevel).sort((left, right) => left.code.localeCompare(right.code, 'es'));
-  const currentBin = selected?.rack_id === rack.id && selected.level_number === activeLevel
-    ? selected
-    : levelLocations.find((location) => location.id === selected?.id) ?? null;
+  }, [rack.id, selected?.level_number]);
+  const currentBin = selected?.rack_id === rack.id ? selected : null;
   useEffect(() => {
     setDisplayName(currentBin?.display_name ?? '');
   }, [currentBin?.id, currentBin?.display_name]);
@@ -1016,24 +1086,17 @@ function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin,
     <section className="rack3d-layout">
       <div className="panel rack3d-panel">
         <div className="rack3d-heading"><div><span className="eyebrow">ESTANTERÍA INDUSTRIAL · VISTA 3D</span><h2>{rack.code}</h2><p>Selecciona un paquete para consultar el producto y su ubicación.</p></div></div>
-        <div className="rack3d-stage"><Suspense fallback={<div className="rack3d-loading">Cargando visor 3D…</div>}><RackViewer3D rack={rack} locations={locations} selectedId={selected?.id ?? null} showAllLocations onSelectProduct={(_products, location) => {
-          setActiveLevel(location.level_number);
+        <div className="rack3d-stage"><Suspense fallback={<div className="rack3d-loading">Cargando visor 3D…</div>}><RackViewer3D rack={rack} locations={locations} selectedId={selected?.id ?? null} showLocationLabels={!qrLabelsOpen} onSelectProduct={(_products, location) => {
           onSelect(locations.find((item) => item.id === location.id) ?? null);
         }} /></Suspense></div>
-        <div className="rack3d-level-picker">{levels.map((level) => {
-          const bins = locations.filter((location) => location.level_number === level);
-          const planned = bins.filter((location) => location.expected_products.length > 0).length;
-          const mismatches = bins.filter((location) => location.expected_products.length > 0 && expectedComparisonRows(location).some((row) => row.state !== 'matched')).length;
-          return <button key={level} className={activeLevel === level ? 'active' : ''} onClick={() => { setActiveLevel(level); onSelect(locations.find((location) => location.level_number === level) ?? null); }}><span>Nivel {level}</span><small>{number(rack.level_heights[level - 1])} cm · {bins.filter((location) => number(location.quantity) > 0).length}/{rack.bins_per_level} ocupados · {mismatches ? `${mismatches} revisar` : `${planned} planificados`}</small></button>;
-        })}</div>
       </div>
       <aside className="panel rack3d-detail">
         {editing && isAdmin ? <><div className="location-heading"><div><span className="eyebrow">CONFIGURACIÓN</span><h2>Estantería</h2></div></div><RackConfigForm rack={rack} onChange={onChange} onDelete={onDelete} /></>
-          : currentBin ? <><div className="location-heading"><div><span className="eyebrow">HUECO · NIVEL {activeLevel}</span><h2>{currentBin.display_name || currentBin.code}</h2><small>{currentBin.code}</small></div><span className="rack3d-unit-pill">{formatNumber(currentBin.quantity)} uds.</span></div><div className="rack3d-detail-content">
+          : currentBin ? <><div className="location-heading"><div><span className="eyebrow">CAJA</span><h2>{currentBin.display_name || currentBin.code}</h2><small>{currentBin.code}</small></div><span className="rack3d-unit-pill">{formatNumber(currentBin.quantity)} uds.</span></div><div className="rack3d-detail-content">
               <h3>Existencias reales</h3>{currentBin.products.filter((product) => number(product.quantity) > 0).map((product) => <div className="location-product" key={`${product.productId}-${product.lot}`}><span className="product-thumb thumb-0"><Package size={16} /></span><span><strong>{product.name}</strong><small>{product.sku}{product.lot ? ` · Lote ${product.lot}` : ''}</small></span><b>{formatNumber(product.quantity)} uds.</b></div>)}
               {!currentBin.products.some((product) => number(product.quantity) > 0) && <div className="location-empty">Este hueco está vacío.</div>}
             </div><ExpectedContentsPanel location={currentBin} />
-            {isAdmin && <form className="bin-width-editor" onSubmit={(event) => {
+            {isAdmin && <form className="bin-name-editor" onSubmit={(event) => {
               event.preventDefault();
               setNameSaving(true);
               void onSaveLocationName(currentBin.id, displayName.trim() || null).finally(() => setNameSaving(false));
@@ -1041,25 +1104,10 @@ function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin,
               <label>Nombre de la caja<input maxLength={100} value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder={currentBin.code} /></label>
               <button type="submit" className="button button-secondary full-button" disabled={nameSaving || displayName.trim() === (currentBin.display_name ?? '')}>{nameSaving ? 'Guardando…' : 'Guardar nombre de caja'}</button>
             </form>}
-            {isAdmin && <form className="bin-width-editor" onSubmit={(event) => {
-              event.preventDefault();
-              const widthUnits = Number(new FormData(event.currentTarget).get('widthUnits'));
-              setWidthSaving(true);
-              void onSaveLocationWidth(currentBin.id, widthUnits).finally(() => setWidthSaving(false));
-            }}>
-              <label>Tamaño horizontal · módulos contiguos<select name="widthUnits" defaultValue={currentBin.width_units} disabled={widthSaving}>
-                {Array.from({ length: rack.bins_per_level - currentBin.slot_position + 1 }, (_value, index) => index + 1).map((units) => <option key={units} value={units}>{units} {units === 1 ? 'hueco' : 'huecos'}</option>)}
-              </select></label>
-              <small>Combina huecos vacíos de esta balda; al separar se recuperan los huecos originales.</small>
-              <button type="submit" className="button button-secondary full-button" disabled={widthSaving || currentBin.products.some((product) => number(product.quantity) > 0) || currentBin.expected_products.length > 0}>
-                {widthSaving ? 'Guardando…' : currentBin.width_units > 1 ? 'Aplicar tamaño o separar caja' : 'Aplicar tamaño de caja'}
-              </button>
-            </form>}
             {isAdmin && <button className="button button-secondary full-button" onClick={() => setEditingExpectedLocationId(currentBin.id)}><Pencil size={14} /> Editar contenido esperado</button>}
             {editingExpectedLocationId === currentBin.id && <ExpectedContentEditor key={currentBin.id} location={currentBin} products={products} onSave={onSaveExpected} onCancel={() => setEditingExpectedLocationId(null)} />}
-            <ExpectedLevelOverview locations={levelLocations} onSelect={onSelect} />
             <button className="button button-primary full-button" disabled={!currentBin.products.some((product) => number(product.quantity) > 0)} onClick={() => onMoveStock(currentBin)}><ArrowLeftRight size={15} /> Mover productos</button>
-          </> : <><div className="location-placeholder"><div className="placeholder-icon"><Package size={21} /></div><h3>Estantería completa</h3><p>Selecciona un hueco para consultar sus productos y cantidades.</p><span className="rack3d-unit-pill">{formatNumber(rack.units)} unidades en esta estantería</span></div><ExpectedLevelOverview locations={locations} onSelect={onSelect} title="Esperado vs. real · todos los huecos" allLevels /></>}
+          </> : <div className="location-placeholder"><div className="placeholder-icon"><Package size={21} /></div><h3>Estantería completa</h3><p>Solo se muestran cajas ocupadas. Selecciona una caja para consultar su contenido.</p><span className="rack3d-unit-pill">{formatNumber(rack.units)} unidades en esta estantería</span></div>}
       </aside>
     </section>
     {qrLabelsOpen && <QrLabelsModal rack={rack} warehouseId={warehouseId} onClose={() => setQrLabelsOpen(false)} />}
@@ -1116,32 +1164,6 @@ function ExpectedContentsPanel({ location }: { location: Location }) {
       <span><strong>{row.name}</strong><small>{row.sku} · Esperado: {row.expected === null ? '—' : `${formatQuantity(row.expected)} uds.`} · Real: {formatQuantity(row.actual)} uds.</small></span>
       <b>{row.status}</b>
     </div>)}
-  </section>;
-}
-
-function ExpectedLevelOverview({ locations, onSelect, title = 'Este nivel · huecos', allLevels = false }: {
-  locations: Location[];
-  onSelect: (location: Location) => void;
-  title?: string;
-  allLevels?: boolean;
-}) {
-  return <section className={`expected-level-overview ${allLevels ? 'all-levels' : ''}`}>
-    <h3>{title}</h3>
-    {locations.map((location) => {
-      const rows = expectedComparisonRows(location);
-      const actual = location.products.filter((product) => number(product.quantity) > 0)
-        .map((product) => `${product.sku} × ${formatQuantity(product.quantity)}`).join(', ');
-      const expected = location.expected_products
-        .map((product) => `${product.sku} × ${formatQuantity(product.quantity)}`).join(', ');
-      const hasPlan = location.expected_products.length > 0;
-      const needsReview = rows.some((row) => row.state !== 'matched');
-      return <button type="button" className={`expected-level-bin ${hasPlan ? needsReview ? 'needs-review' : 'matched' : ''}`} key={location.id} onClick={() => onSelect(location)}>
-        <strong>{location.display_name || location.code}</strong>
-        <small>Real: {actual || 'Vacío'}</small>
-        <small>Esperado: {expected || 'Sin plan'}</small>
-        <b>{hasPlan ? needsReview ? 'Revisar' : 'Correcto' : 'Sin plan'}</b>
-      </button>;
-    })}
   </section>;
 }
 
@@ -1391,12 +1413,11 @@ export function LegacyMapPage({ locations, racks, selected, isAdmin, onSelect, o
   </>;
 }
 
-function MapPage({ products, locations, racks, warehouse, aisles, selected, initialRackId, isAdmin, onSelect, onRefresh, onNotify, onMoveStock, onSaveExpected, onSaveLocationWidth, onSaveLocationName, onEditingChange }: {
+function MapPage({ products, locations, racks, warehouse, aisles, selected, initialRackId, isAdmin, onSelect, onRefresh, onNotify, onMoveStock, onSaveExpected, onSaveLocationName, onEditingChange }: {
   products: Product[]; locations: Location[]; racks: Rack[]; warehouse: WarehouseMap; aisles: Aisle[];
   selected: Location | null; initialRackId: string | null; isAdmin: boolean; onSelect: (location: Location | null) => void;
   onRefresh: () => Promise<void>; onNotify: (message: string) => void; onMoveStock: (location: Location) => void;
   onSaveExpected: (locationId: string, expected: { productId: string; quantity: number }[]) => Promise<boolean>;
-  onSaveLocationWidth: (locationId: string, widthUnits: number) => Promise<boolean>;
   onSaveLocationName: (locationId: string, displayName: string | null) => Promise<boolean>;
   onEditingChange: (editing: boolean) => void
 }) {
@@ -1680,7 +1701,6 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
     onSelect={onSelect}
     onMoveStock={onMoveStock}
     onSaveExpected={onSaveExpected}
-    onSaveLocationWidth={onSaveLocationWidth}
     onSaveLocationName={onSaveLocationName}
     onChange={(field, value) => updateRack(selectedRack.id, field, value)}
     onDelete={() => removeRack(selectedRack)}
@@ -2061,7 +2081,12 @@ function MovementForm({ products, locations, racks, warehouses, currentWarehouse
         {toBinId && <div><span>Destino</span><strong>{selectedDestination ? locationLabel(selectedDestination) : toBinId}</strong></div>}
       </div>
       <label>Cantidad<input required name="quantity" type="number" min="0.01" step="0.01" placeholder="0" autoFocus /></label>
-        {toBinId && selectedDestination && isEmpty(selectedDestination) && <label>Nombre de la caja (opcional)<input name="binName" maxLength={100} placeholder="Ej. Caja azul · tornillería M8" /><small className="field-help">Se guardará en esta ubicación y aparecerá en el visor 3D.</small></label>}
+        {toBinId && selectedDestination && isEmpty(selectedDestination) && <>
+          <label>Nombre de la caja (opcional)<input name="binName" maxLength={100} placeholder="Ej. Caja azul · tornillería M8" /><small className="field-help">Se guardará en esta ubicación y aparecerá en el visor 3D.</small></label>
+          <label>Tamaño de la caja<select name="binWidthUnits" defaultValue={selectedDestination.width_units}>
+            {Array.from({ length: Math.min(4, (destinationRacks.find((rack) => rack.id === selectedDestination.rack_id)?.bins_per_level ?? 1) - selectedDestination.slot_position + 1) }, (_value, index) => index + 1).map((units) => <option key={units} value={units}>{units} {units === 1 ? 'hueco' : 'huecos'} seguidos</option>)}
+          </select><small className="field-help">Se crea ocupando huecos contiguos a la derecha en la misma balda. Solo se puede hacer con huecos vacíos.</small></label>
+        </>}
       {choosesExistingLot
         ? <label>Lote (opcional; necesario para caducidad)<select name="lotCode" defaultValue=""><option value="">Automático (FIFO)</option>{sourceLots.map((lot) => <option key={lot.code} value={lot.code}>{lot.code} · {formatNumber(lot.quantity)} uds.</option>)}</select><small className="field-help">Déjalo en automático para descontar primero el lote más antiguo.</small></label>
         : <label>Lote (opcional; necesario para caducidad)<input name="lotCode" placeholder="Código impreso en el envase" /></label>}
