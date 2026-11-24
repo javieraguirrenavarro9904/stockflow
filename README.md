@@ -18,7 +18,7 @@ npm install
 npm run dev
 ```
 
-La aplicación web estará en `http://localhost:5173` y la API en `http://localhost:3001`. La base de datos se inicializa automáticamente con el esquema, las migraciones SQL y los datos de demostración en el primer arranque del volumen. La API también aplica de forma idempotente las migraciones de sesiones, geometría, compras, nombre de ubicaciones, contenido esperado, cajas grandes, alertas y dimensiones ampliadas de estanterías al arrancar.
+La aplicación web estará en `http://localhost:5173` y la API en `http://localhost:3001`. La base de datos se inicializa automáticamente con el esquema, las migraciones SQL y los datos de demostración en el primer arranque del volumen. La API también aplica de forma idempotente las migraciones de sesiones, geometría, compras, nombre de ubicaciones, contenido esperado, cajas grandes, alertas, ubicaciones de suelo, catálogos por almacén y artículos en uso al arrancar.
 
 ### Cuentas locales de demostración
 
@@ -47,7 +47,7 @@ No pongas `DATABASE_URL`, contraseñas ni otros secretos en Vercel o en variable
 
 ### Varios almacenes y transferencias
 
-El administrador puede crear almacenes desde el selector de **Almacén activo**, en la barra lateral. Cada uno tiene su propio mapa, ubicaciones y existencias; el catálogo de productos se comparte para poder transferir mercancía entre ellos. Para mover stock, abre **Movimientos → Transferencia**, elige el almacén de destino y después su ubicación. El historial de la transferencia aparece en ambos almacenes.
+El administrador puede crear almacenes desde el selector de **Almacén activo**, en la barra lateral. Cada uno tiene su propio mapa, ubicaciones, existencias, catálogo de productos y proveedores. Una transferencia requiere que el mismo SKU exista también en el almacén de destino; si no está dado de alta allí, primero hay que crear el producto. Para mover stock, abre **Movimientos → Transferencia**, elige el almacén de destino y después su ubicación. El historial de la transferencia aparece en ambos almacenes.
 
 ### Compras, reposición y pedidos de salida
 
@@ -55,7 +55,7 @@ El administrador puede crear almacenes desde el selector de **Almacén activo**,
 
 **Pedidos de salida** permite registrar un cliente y una referencia, añadir productos y reservar stock automáticamente por ubicación y lote. La lista de picking muestra las ubicaciones asignadas. Al confirmar la salida, se descuentan las reservas y existencias y se registra el movimiento de salida asociado al pedido. Un pedido pendiente o en preparación puede cancelarse para liberar sus reservas. Los nombres de cliente se guardan en cada pedido; todavía no existe un módulo de CRM ni una ficha central de clientes.
 
-Las ubicaciones se describen con su ruta completa: almacén, zona, pasillo, estantería, nivel y hueco. El formulario de movimientos guía el registro en cuatro pasos: tipo, producto, ubicación(es) en el visor 3D y cantidad. En origen solo se pueden seleccionar huecos con ese producto; en destino se resaltan los huecos que ya lo contienen y también se permiten ubicaciones vacías para entradas y transferencias. Al guardar en una ubicación vacía se puede asignar un nombre opcional y elegir una caja de hasta 12 huecos contiguos, limitada por los espacios disponibles de la balda.
+Las ubicaciones se describen con su ruta completa: almacén, zona, pasillo, estantería, nivel y hueco. El formulario de movimientos guía el registro en cuatro pasos: tipo, producto, ubicación(es) en el visor 3D y cantidad. En origen solo se pueden seleccionar huecos con ese producto; en destino se resaltan los huecos que ya lo contienen y también se permiten ubicaciones vacías para entradas y transferencias. **En uso** descuenta existencias disponibles y deja un pendiente que aparece al registrar una **Devolución**; se pueden devolver cantidades parciales y el saldo pendiente se conserva hasta completar la devolución. Al guardar en una ubicación vacía se puede asignar un nombre opcional y elegir una caja de hasta 12 huecos contiguos, limitada por los espacios disponibles de la balda.
 
 El código de barras del producto es opcional: se escanea la etiqueta EAN/UPC si existe; si no, se deja vacío y se usa el SKU. El lote es el código que figura en el envase y también puede dejarse vacío; sin lote indicado, las salidas descuentan primero el más antiguo. La referencia/albarán es opcional y sirve para guardar el número del documento del proveedor o pedido.
 
@@ -78,7 +78,7 @@ Para probar los QR desde un móvil en la misma red Wi-Fi:
 
 Al registrar una entrada o transferencia hacia una ubicación vacía, elige el tamaño de caja de 1 a 12 huecos contiguos y, si quieres, asígnale un nombre. La caja ocupa los módulos siguientes en la misma balda y se usa como una única ubicación. También se puede ajustar el tamaño desde la configuración de una ubicación. Solo se permite combinar o separar cuando todas las ubicaciones afectadas están vacías y no tienen contenido esperado. No se combinan niveles distintos; para artículos altos, ajusta la altura del nivel en la configuración de la estantería.
 
-Las medidas se introducen en centímetros. El visor 3D usa el ancho y fondo de la estantería y escala la altura a partir de sus niveles; al crearla se puede fijar la altura total hasta 1200 cm (12 m), y el ancho puede llegar a 2000 cm (20 m). El número de huecos por nivel se limita al espacio físico disponible. También se puede definir cuántas filas inventariables tiene la estantería hacia el fondo; su cantidad se limita al fondo disponible y al máximo de 100 ubicaciones. Las cajas combinadas ocupan la anchura proporcional a los módulos que abarcan y no pueden cruzar filas de profundidad.
+Las medidas se introducen en centímetros. El visor 3D usa el ancho y fondo de la estantería y escala la altura a partir de sus niveles; al crearla se puede fijar la altura total hasta 1200 cm (12 m), y el ancho puede llegar a 2000 cm (20 m). El número de huecos por nivel se limita al espacio físico disponible. También se puede definir cuántas filas inventariables tiene la estantería hacia el fondo; su cantidad se limita al fondo disponible y al máximo de 100 ubicaciones en las baldas. Las ubicaciones de Suelo son adicionales. Las cajas combinadas ocupan la anchura proporcional a los módulos que abarcan y no pueden cruzar filas de profundidad.
 
 Los movimientos de empleados generan alertas persistentes para los administradores y se actualizan en tiempo real, sin recargar la página. Se consultan desde **Configuración → Alertas de movimientos** o desde la campana de notificaciones, donde aparece el autor, el tipo de movimiento, sus productos, unidades y fecha. Cada administrador puede marcar las alertas como leídas.
 
@@ -94,6 +94,8 @@ docker compose exec -T db psql -U wms -d wms -f /docker-entrypoint-initdb.d/006-
 docker compose exec -T db psql -U wms -d wms -f /docker-entrypoint-initdb.d/007-wide-bins.sql
 docker compose exec -T db psql -U wms -d wms -f /docker-entrypoint-initdb.d/009-rack-dimensions.sql
 docker compose exec -T db psql -U wms -d wms -f /docker-entrypoint-initdb.d/010-rack-depth-and-structures.sql
+docker compose exec -T db psql -U wms -d wms -f /docker-entrypoint-initdb.d/011-floor-storage-locations.sql
+docker compose exec -T db psql -U wms -d wms -f /docker-entrypoint-initdb.d/012-warehouse-catalog-and-in-use.sql
 ```
 
 Variables disponibles en `.env`:
@@ -133,7 +135,9 @@ docker-compose.yml        # PostgreSQL local
 
 El modelo de datos relaciona almacén, zona, pasillo, estantería, nivel y ubicación (`bin`); los pasillos se conservan como relación interna de compatibilidad. `WarehouseMap2D` representa el recinto y las estanterías con SVG vectorial para mantener la nitidez al ampliar. En edición, la posición y el tamaño de las estanterías se ajustan a una cuadrícula de 1 m y se validan contra el perímetro. Se pueden dibujar paredes y tabiques como tramos, dejando huecos donde haya puertas; ambos actúan como obstáculos y el servidor impide colocar estanterías encima. Las estructuras se comparten y guardan con el plano. Se añaden y mueven las estanterías directamente sobre el suelo del almacén, sin dibujar ni configurar pasillos. Al seleccionar una estantería se abre su detalle individual. `RackViewer3D` usa Three.js con React Three Fiber y OrbitControls para mostrar bastidores y largueros metálicos y paquetes en sus huecos; al seleccionar un paquete se consulta su producto y ubicación. El visor representa el ancho y el fondo físicos a escala, separa las ubicaciones de cada fila de fondo y adapta la cámara a las dimensiones. Antes de crear una estantería, el asistente permite definir su nombre, código, dimensiones, altura total (hasta 12 m), número de niveles, altura individual, huecos por nivel y filas de fondo; el ancho admite hasta 20 m. Se pueden definir las dimensiones del almacén y cada nivel admite una altura distinta. Los cambios se mantienen como borrador hasta **Guardar y salir**; **Descartar cambios** revierte el borrador. El editor protege la trazabilidad: no permite eliminar estanterías con stock o movimientos asociados ni reducir los niveles o ubicaciones existentes.
 
-El catálogo se relaciona con categorías y proveedores. El stock se mantiene por producto, lote y ubicación; los lotes pueden llevar fecha de caducidad. `movements` y `movement_lines` forman el Kardex.
+Cada estantería incluye también ubicaciones de **Suelo**, para registrar productos en el espacio entre el piso y el primer nivel. Se pueden seleccionar desde el visor 3D y usar en movimientos, transferencias y recepciones de compras, igual que las ubicaciones de las baldas.
+
+El catálogo de productos y proveedores pertenece a cada almacén; las categorías se comparten. Los SKU y códigos de barras son únicos dentro de cada almacén. El stock se mantiene por producto, lote y ubicación; los lotes pueden llevar fecha de caducidad. `movements` y `movement_lines` forman el Kardex, y los préstamos `in_use_loans` conservan el saldo devuelto y pendiente para cada artículo en uso.
 
 El administrador puede añadir o eliminar categorías y proveedores desde **Configuración → Categorías y proveedores**. Al borrar una categoría, los productos asociados quedan sin categoría; al borrar un proveedor, sus productos quedan sin proveedor. No se permite eliminar proveedores con pedidos de compra en el historial, para conservar la trazabilidad.
 
@@ -150,7 +154,7 @@ Las sesiones usan tokens aleatorios de corta duración (8 horas); la base conser
 - `GET /api/catalog-options`, `POST /api/categories`, `DELETE /api/categories/:id`, `POST /api/suppliers`, `DELETE /api/suppliers/:id` (administrador)
 - `GET /api/map-layout`, `PUT /api/map-layout` (administrador; guarda el plano completo en una transacción SQL)
 - `GET /api/locations`, `PUT /api/locations/:id/expected-content`, `PUT /api/locations/:id/width` y `PATCH /api/locations/:id/display-name` (administrador), `GET /api/racks?warehouseId=...`, `POST /api/racks`, `PATCH /api/racks/:id`, `PATCH /api/racks/map`
-- `GET /api/movements`, `POST /api/movements`
+- `GET /api/movements`, `POST /api/movements`, `GET /api/in-use` (pendientes de devolución por almacén)
 - `GET /api/replenishment`, `GET /api/purchase-orders`, `POST /api/purchase-orders`, `POST /api/purchase-orders/:id/receive`, `POST /api/purchase-orders/:id/cancel`
 - `GET /api/sales-orders`, `POST /api/sales-orders`, `POST /api/sales-orders/:id/picking`, `POST /api/sales-orders/:id/fulfill`, `POST /api/sales-orders/:id/cancel`
 - `POST /api/assistant`

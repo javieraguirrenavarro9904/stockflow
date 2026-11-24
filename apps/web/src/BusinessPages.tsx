@@ -204,7 +204,7 @@ export function PurchasingPage({ suggestions, orders, locations, isAdmin, onCrea
           {selectedOrder.lines.map((line) => <tr key={line.id}>
             <td><strong className="table-primary">{line.name}</strong><span className="table-secondary">{line.sku}</span></td>
             <td>{quantity(line.quantity)}</td>
-            <td><select required name={`bin-${line.id}`} defaultValue="" onChange={(event) => setSelectedBins((current) => ({ ...current, [line.id]: event.target.value }))}><option value="" disabled>Selecciona ubicación</option>{locations.map((location) => <option key={location.id} value={location.id}>{location.display_name ? `${location.display_name} · ` : ''}{location.warehouse} · {location.zone} · {location.aisle} · {location.rack} · N{location.level_number} · {location.code}</option>)}</select>
+            <td><select required name={`bin-${line.id}`} defaultValue="" onChange={(event) => setSelectedBins((current) => ({ ...current, [line.id]: event.target.value }))}><option value="" disabled>Selecciona ubicación</option>{locations.map((location) => <option key={location.id} value={location.id}>{location.display_name ? `${location.display_name} · ` : ''}{location.warehouse} · {location.zone} · {location.aisle} · {location.rack} · {location.level_number === 0 ? 'Suelo' : `N${location.level_number}`} · {location.code}</option>)}</select>
               {locations.find((location) => location.id === selectedBins[line.id] && amount(location.quantity) <= 0) && <label>Nombre de la caja (opcional)<input name={`bin-name-${line.id}`} maxLength={100} placeholder="Ej. Caja azul · tornillería M8" /></label>}
             </td>
             <td><input name={`lot-${line.id}`} maxLength={100} placeholder="Lote del fabricante" /></td>

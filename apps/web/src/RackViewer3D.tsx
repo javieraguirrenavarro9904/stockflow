@@ -33,6 +33,7 @@ type Props = {
   productId?: string;
   selectableLocationIds?: string[];
   showAllLocations?: boolean;
+  showFloorLocations?: boolean;
   showLocationLabels?: boolean;
 };
 
@@ -50,7 +51,7 @@ function ResizeCamera() {
   return null;
 }
 
-function RackScene({ rack, locations, selectedId, onSelectProduct, productId, selectableLocationIds, showAllLocations, showLocationLabels = true }: Props) {
+function RackScene({ rack, locations, selectedId, onSelectProduct, productId, selectableLocationIds, showAllLocations, showFloorLocations, showLocationLabels = true }: Props) {
   const width = Math.max(1.6, number(rack.map_width) / 100);
   const depth = Math.max(1, number(rack.map_height) / 100);
   const uprightWidth = Math.min(0.12, Math.max(0.05, width * 0.025));
@@ -67,6 +68,8 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
   const finalLevelSpacing = Math.max(0.01, number(rack.level_heights.at(-1) ?? 240) / 100);
   const finalBoxHeight = Math.min(0.62, Math.max(0.12, finalLevelSpacing * 0.65));
   const rackHeight = (levelPositions.at(-1) ?? 0.12) + finalBoxHeight + 0.1;
+  const floorGap = Math.max(0.1, (levelPositions[0] ?? 0.42) - beamHeight / 2 - 0.04);
+  const floorBoxHeight = Math.min(0.55, floorGap * 0.75);
   const gridSize = Math.max(12, Math.ceil(Math.max(width, depth) * 1.5 / 2) * 2);
   const gridDivisions = Math.max(24, Math.round(gridSize * 2));
   const usableWidth = width - uprightWidth * 2;
@@ -107,7 +110,8 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
         </group>
       ))}
 
-      {locations.filter((location) => showAllLocations || number(location.quantity) > 0).map((location, index) => {
+      {locations.filter((location) => showAllLocations || number(location.quantity) > 0 || (showFloorLocations && location.level_number === 0)).map((location, index) => {
+        const isFloor = location.level_number === 0;
         const levelIndex = Math.max(0, Math.min(rack.level_count - 1, location.level_number - 1));
         const levelY = levelPositions[levelIndex] ?? 1;
         const x = -width / 2 + uprightWidth + slotPitch * (location.slot_position - 1 + location.width_units / 2);
@@ -115,7 +119,8 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
         const z = usableDepth / 2 - depthPitch * (depthIndex + 0.5);
         const slotWidth = slotPitch * location.width_units - boxGap;
         const levelSpacing = Math.max(0.01, number(rack.level_heights[levelIndex] ?? 240) / 100);
-        const boxHeight = Math.min(0.62, Math.max(0.12, levelSpacing * 0.65));
+        const boxHeight = isFloor ? floorBoxHeight : Math.min(0.62, Math.max(0.12, levelSpacing * 0.65));
+        const boxY = isFloor ? boxHeight / 2 + 0.02 : levelY + boxHeight / 2 + beamHeight / 2;
         const isSelected = location.id === selectedId;
         const hasProduct = productId
           ? location.products.some((product) => product.productId === productId && number(product.quantity) > 0)
@@ -126,7 +131,7 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
         return (
           <group key={location.id}>
             <mesh
-              position={[x, levelY + boxHeight / 2 + beamHeight / 2, z]}
+              position={[x, boxY, z]}
               castShadow
               onClick={isSelectable ? (event) => {
                 event.stopPropagation();
@@ -141,7 +146,7 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
                 emissiveIntensity={isSelected ? 0.25 : isHighlighted ? 0.12 : 0}
               />
             </mesh>
-            {showLocationLabels && number(location.quantity) > 0 && <Html position={[x, levelY + boxHeight + beamHeight / 2 + 0.08, z]} center distanceFactor={8} zIndexRange={[10, 0]} style={{ pointerEvents: 'none', whiteSpace: 'nowrap' }}><span className="rack-bin-name">{location.display_name || location.code}</span></Html>}
+            {showLocationLabels && number(location.quantity) > 0 && <Html position={[x, boxY + boxHeight / 2 + (isFloor ? 0.04 : beamHeight / 2 + 0.08), z]} center distanceFactor={8} zIndexRange={[10, 0]} style={{ pointerEvents: 'none', whiteSpace: 'nowrap' }}><span className="rack-bin-name">{location.display_name || location.code}</span></Html>}
           </group>
         );
       })}

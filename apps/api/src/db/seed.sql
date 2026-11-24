@@ -31,24 +31,38 @@ ON CONFLICT (code) DO NOTHING;
 INSERT INTO categories (name) VALUES ('Electrónica'), ('Accesorios'), ('Componentes')
 ON CONFLICT (name) DO NOTHING;
 
-INSERT INTO suppliers (name, email) VALUES
+INSERT INTO suppliers (warehouse_id, name, email)
+SELECT w.id, seed.name, seed.email
+FROM warehouses w
+CROSS JOIN (VALUES
   ('TechSupply Europe', 'pedidos@techsupply.example'),
   ('Global Components', 'ventas@globalcomponents.example')
-ON CONFLICT DO NOTHING;
+) AS seed(name, email)
+WHERE w.code = 'MAD-01'
+  AND NOT EXISTS (
+    SELECT 1 FROM suppliers s WHERE s.warehouse_id = w.id AND s.name = seed.name
+  );
 
-INSERT INTO products (sku, name, category_id, supplier_id, barcode, unit_of_measure, min_stock)
-VALUES
-  ('SKU-1001', 'Auriculares inalámbricos Pro', (SELECT id FROM categories WHERE name = 'Electrónica'), (SELECT id FROM suppliers WHERE name = 'TechSupply Europe'), '8412345001001', 'ud', 20),
-  ('SKU-1002', 'Teclado mecánico compacto', (SELECT id FROM categories WHERE name = 'Accesorios'), (SELECT id FROM suppliers WHERE name = 'Global Components'), '8412345001002', 'ud', 15),
-  ('SKU-1003', 'Ratón ergonómico inalámbrico', (SELECT id FROM categories WHERE name = 'Accesorios'), (SELECT id FROM suppliers WHERE name = 'TechSupply Europe'), '8412345001003', 'ud', 25),
-  ('SKU-1004', 'Hub USB-C 7 en 1', (SELECT id FROM categories WHERE name = 'Electrónica'), (SELECT id FROM suppliers WHERE name = 'Global Components'), '8412345001004', 'ud', 10),
-  ('SKU-1005', 'Cable USB-C trenzado 2 m', (SELECT id FROM categories WHERE name = 'Componentes'), (SELECT id FROM suppliers WHERE name = 'TechSupply Europe'), '8412345001005', 'ud', 30)
-ON CONFLICT (sku) DO NOTHING;
+INSERT INTO products (warehouse_id, sku, name, category_id, supplier_id, barcode, unit_of_measure, min_stock)
+SELECT w.id, seed.sku, seed.name, c.id, s.id, seed.barcode, 'ud', seed.min_stock
+FROM warehouses w
+CROSS JOIN (VALUES
+  ('SKU-1001', 'Auriculares inalámbricos Pro', 'Electrónica', 'TechSupply Europe', '8412345001001', 20),
+  ('SKU-1002', 'Teclado mecánico compacto', 'Accesorios', 'Global Components', '8412345001002', 15),
+  ('SKU-1003', 'Ratón ergonómico inalámbrico', 'Accesorios', 'TechSupply Europe', '8412345001003', 25),
+  ('SKU-1004', 'Hub USB-C 7 en 1', 'Electrónica', 'Global Components', '8412345001004', 10),
+  ('SKU-1005', 'Cable USB-C trenzado 2 m', 'Componentes', 'TechSupply Europe', '8412345001005', 30)
+) AS seed(sku, name, category, supplier, barcode, min_stock)
+JOIN categories c ON c.name = seed.category
+JOIN suppliers s ON s.name = seed.supplier AND s.warehouse_id = w.id
+WHERE w.code = 'MAD-01'
+ON CONFLICT (warehouse_id, sku) DO NOTHING;
 
 INSERT INTO lots (product_id, lot_code, received_at, expires_at)
 SELECT p.id, 'LOT-' || p.sku || '-01', now() - interval '12 days',
        CASE WHEN p.sku = 'SKU-1004' THEN current_date + 45 ELSE NULL END
 FROM products p
+WHERE p.warehouse_id = (SELECT id FROM warehouses WHERE code = 'MAD-01')
 ON CONFLICT (product_id, lot_code) DO NOTHING;
 
 INSERT INTO stock_balances (product_id, lot_id, bin_id, quantity)
@@ -58,4 +72,8 @@ SELECT p.id, l.id, b.id,
 FROM products p
 JOIN lots l ON l.product_id = p.id AND l.lot_code = 'LOT-' || p.sku || '-01'
 JOIN bins b ON b.code = 'A1-01-1'
+JOIN rack_levels rl ON rl.id = b.rack_level_id
+JOIN racks r ON r.id = rl.rack_id
+JOIN aisles a ON a.id = r.aisle_id
+JOIN zones z ON z.id = a.zone_id AND z.warehouse_id = p.warehouse_id
 ON CONFLICT DO NOTHING;

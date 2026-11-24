@@ -75,7 +75,7 @@ CREATE TABLE IF NOT EXISTS racks (
 CREATE TABLE IF NOT EXISTS rack_levels (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   rack_id UUID NOT NULL REFERENCES racks(id) ON DELETE CASCADE,
-  level_number INTEGER NOT NULL CHECK (level_number > 0),
+  level_number INTEGER NOT NULL CHECK (level_number >= 0),
   height_cm NUMERIC(7, 2) NOT NULL DEFAULT 240 CHECK (height_cm BETWEEN 1 AND 1000),
   UNIQUE (rack_id, level_number)
 );
@@ -107,23 +107,31 @@ CREATE TABLE IF NOT EXISTS categories (
 
 CREATE TABLE IF NOT EXISTS suppliers (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  warehouse_id UUID NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
   name TEXT NOT NULL,
   email TEXT,
-  phone TEXT
+  phone TEXT,
+  UNIQUE (id, warehouse_id)
 );
 
 CREATE TABLE IF NOT EXISTS products (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  sku TEXT NOT NULL UNIQUE,
+  warehouse_id UUID NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+  sku TEXT NOT NULL,
   name TEXT NOT NULL,
   description TEXT,
   category_id UUID REFERENCES categories(id) ON DELETE SET NULL,
-  supplier_id UUID REFERENCES suppliers(id) ON DELETE SET NULL,
-  barcode TEXT UNIQUE,
+  supplier_id UUID,
+  barcode TEXT,
   unit_of_measure TEXT NOT NULL DEFAULT 'ud',
   min_stock NUMERIC(12, 2) NOT NULL DEFAULT 0 CHECK (min_stock >= 0),
   active BOOLEAN NOT NULL DEFAULT true,
-  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+  UNIQUE (warehouse_id, sku),
+  UNIQUE (warehouse_id, barcode),
+  UNIQUE (id, warehouse_id),
+  FOREIGN KEY (supplier_id, warehouse_id) REFERENCES suppliers(id, warehouse_id)
+    ON DELETE SET NULL (supplier_id)
 );
 
 CREATE TABLE IF NOT EXISTS lots (
@@ -156,7 +164,7 @@ CREATE TABLE IF NOT EXISTS bin_expectations (
 
 CREATE TABLE IF NOT EXISTS movements (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  type TEXT NOT NULL CHECK (type IN ('receipt', 'dispatch', 'transfer', 'adjustment')),
+  type TEXT NOT NULL CHECK (type IN ('receipt', 'dispatch', 'transfer', 'adjustment', 'in_use', 'return')),
   status TEXT NOT NULL DEFAULT 'posted' CHECK (status IN ('posted', 'reversed')),
   reference TEXT,
   notes TEXT,
@@ -181,7 +189,9 @@ CREATE TABLE IF NOT EXISTS movement_lines (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
   movement_id UUID NOT NULL REFERENCES movements(id),
   product_id UUID NOT NULL REFERENCES products(id),
+  destination_product_id UUID REFERENCES products(id),
   lot_id UUID REFERENCES lots(id),
+  destination_lot_id UUID REFERENCES lots(id),
   quantity NUMERIC(12, 2) NOT NULL CHECK (quantity > 0),
   from_bin_id UUID REFERENCES bins(id),
   to_bin_id UUID REFERENCES bins(id),

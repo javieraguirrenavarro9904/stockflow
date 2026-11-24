@@ -488,7 +488,7 @@ app.get('/api/overview', async (_req, res, next) => {
     const [stats, movements, lowStock, expiring] = await Promise.all([
       pool.query(`
         SELECT
-          (SELECT count(*)::int FROM products WHERE active) AS products,
+          (SELECT count(*)::int FROM products WHERE active AND warehouse_id = $1) AS products,
           COALESCE((SELECT sum(sb.quantity)::numeric FROM stock_balances sb
             JOIN bins b ON b.id = sb.bin_id JOIN rack_levels rl ON rl.id = b.rack_level_id
             JOIN racks r ON r.id = rl.rack_id JOIN aisles a ON a.id = r.aisle_id
@@ -505,7 +505,7 @@ app.get('/api/overview', async (_req, res, next) => {
             LEFT JOIN racks r ON r.id = rl.rack_id
             LEFT JOIN aisles a ON a.id = r.aisle_id
             LEFT JOIN zones z ON z.id = a.zone_id AND z.warehouse_id = $1
-            WHERE p.active GROUP BY p.id, p.min_stock
+            WHERE p.active AND p.warehouse_id = $1 GROUP BY p.id, p.min_stock
             HAVING COALESCE(sum(sb.quantity - sb.reserved_quantity) FILTER (WHERE z.warehouse_id = $1), 0) <= p.min_stock
           ) low) AS low_stock
       `, [warehouseId]),
@@ -515,7 +515,15 @@ app.get('/api/overview', async (_req, res, next) => {
                COALESCE(sum(ml.quantity), 0)::numeric AS units
         FROM movements m
         LEFT JOIN movement_lines ml ON ml.movement_id = m.id
-        LEFT JOIN products p ON p.id = ml.product_id
+        LEFT JOIN products p ON p.id = CASE
+          WHEN ml.destination_product_id IS NOT NULL AND EXISTS (
+            SELECT 1 FROM bins destination_bin
+            JOIN rack_levels destination_level ON destination_level.id = destination_bin.rack_level_id
+            JOIN racks destination_rack ON destination_rack.id = destination_level.rack_id
+            JOIN aisles destination_aisle ON destination_aisle.id = destination_rack.aisle_id
+            JOIN zones destination_zone ON destination_zone.id = destination_aisle.zone_id
+            WHERE destination_bin.id = ml.to_bin_id AND destination_zone.warehouse_id = $1
+          ) THEN ml.destination_product_id ELSE ml.product_id END
         WHERE EXISTS (
           SELECT 1 FROM movement_lines scoped
           JOIN bins b ON b.id IN (scoped.from_bin_id, scoped.to_bin_id)
@@ -535,7 +543,7 @@ app.get('/api/overview', async (_req, res, next) => {
         LEFT JOIN racks r ON r.id = rl.rack_id
         LEFT JOIN aisles a ON a.id = r.aisle_id
         LEFT JOIN zones z ON z.id = a.zone_id
-        WHERE p.active GROUP BY p.id
+        WHERE p.active AND p.warehouse_id = $1 GROUP BY p.id
         HAVING COALESCE(sum(sb.quantity - sb.reserved_quantity) FILTER (WHERE z.warehouse_id = $1), 0) <= p.min_stock
         ORDER BY stock ASC LIMIT 5
       `, [warehouseId]),
@@ -570,14 +578,15 @@ app.get('/api/products', async (req, res, next) => {
              COALESCE(sum(sb.reserved_quantity) FILTER (WHERE z.warehouse_id = $2), 0)::numeric AS reserved
       FROM products p
       LEFT JOIN categories c ON c.id = p.category_id
-      LEFT JOIN suppliers s ON s.id = p.supplier_id
+      LEFT JOIN suppliers s ON s.id = p.supplier_id AND s.warehouse_id = p.warehouse_id
       LEFT JOIN stock_balances sb ON sb.product_id = p.id
       LEFT JOIN bins b ON b.id = sb.bin_id
       LEFT JOIN rack_levels rl ON rl.id = b.rack_level_id
       LEFT JOIN racks r ON r.id = rl.rack_id
       LEFT JOIN aisles a ON a.id = r.aisle_id
       LEFT JOIN zones z ON z.id = a.zone_id
-      WHERE p.active AND ($1 = '' OR p.name ILIKE '%' || $1 || '%' OR p.sku ILIKE '%' || $1 || '%' OR p.barcode ILIKE '%' || $1 || '%')
+      WHERE p.active AND p.warehouse_id = $2
+        AND ($1 = '' OR p.name ILIKE '%' || $1 || '%' OR p.sku ILIKE '%' || $1 || '%' OR p.barcode ILIKE '%' || $1 || '%')
       GROUP BY p.id, c.name, s.name ORDER BY p.name
     `, [search, warehouseId]);
     res.json(result.rows);
@@ -588,9 +597,10 @@ app.get('/api/products', async (req, res, next) => {
 
 app.get('/api/catalog-options', async (_req, res, next) => {
   try {
+    const warehouseId = res.locals.warehouseId as string;
     const [categories, suppliers] = await Promise.all([
       pool.query('SELECT id, name FROM categories ORDER BY name'),
-      pool.query('SELECT id, name FROM suppliers ORDER BY name')
+      pool.query('SELECT id, name FROM suppliers WHERE warehouse_id = $1 ORDER BY name', [warehouseId])
     ]);
     res.json({ categories: categories.rows, suppliers: suppliers.rows });
   } catch (error) {
@@ -640,8 +650,8 @@ app.post('/api/suppliers', requireAdmin, async (req, res, next) => {
   if (!parsed.success) return res.status(400).json({ error: 'Nombre de proveedor no válido' });
   try {
     const result = await pool.query(
-      'INSERT INTO suppliers (name) VALUES ($1) RETURNING id, name',
-      [parsed.data.name]
+      'INSERT INTO suppliers (warehouse_id, name) VALUES ($1, $2) RETURNING id, name',
+      [res.locals.warehouseId, parsed.data.name]
     );
     res.status(201).json(result.rows[0]);
   } catch (error) {
@@ -650,16 +660,26 @@ app.post('/api/suppliers', requireAdmin, async (req, res, next) => {
 });
 
 app.delete('/api/suppliers/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, next) => {
+  const warehouseId = res.locals.warehouseId as string;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const supplier = await client.query('SELECT id FROM suppliers WHERE id = $1 FOR UPDATE', [req.params.id]);
+    const supplier = await client.query(
+      'SELECT id FROM suppliers WHERE id = $1 AND warehouse_id = $2 FOR UPDATE',
+      [req.params.id, warehouseId]
+    );
     if (!supplier.rowCount) throw Object.assign(new Error('Proveedor no encontrado'), { status: 404 });
-    const purchaseOrders = await client.query('SELECT id FROM purchase_orders WHERE supplier_id = $1 LIMIT 1', [req.params.id]);
+    const purchaseOrders = await client.query(
+      'SELECT id FROM purchase_orders WHERE supplier_id = $1 AND warehouse_id = $2 LIMIT 1',
+      [req.params.id, warehouseId]
+    );
     if (purchaseOrders.rowCount)
       throw Object.assign(new Error('No se puede eliminar: el proveedor tiene pedidos de compra en el historial'), { status: 409 });
-    await client.query('UPDATE products SET supplier_id = NULL WHERE supplier_id = $1', [req.params.id]);
-    await client.query('DELETE FROM suppliers WHERE id = $1', [req.params.id]);
+    await client.query(
+      'UPDATE products SET supplier_id = NULL WHERE supplier_id = $1 AND warehouse_id = $2',
+      [req.params.id, warehouseId]
+    );
+    await client.query('DELETE FROM suppliers WHERE id = $1 AND warehouse_id = $2', [req.params.id, warehouseId]);
     await client.query('COMMIT');
     res.json({ deleted: true });
   } catch (error) {
@@ -684,12 +704,20 @@ app.post('/api/products', requireAdmin, async (req, res, next) => {
   const parsed = productSchema.safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Datos de producto no válidos', details: parsed.error.flatten() });
   try {
+    const warehouseId = res.locals.warehouseId as string;
     const { sku, name, barcode, unit_of_measure, min_stock, category_id, supplier_id } = parsed.data;
+    if (supplier_id) {
+      const supplier = await pool.query(
+        'SELECT id FROM suppliers WHERE id = $1 AND warehouse_id = $2',
+        [supplier_id, warehouseId]
+      );
+      if (!supplier.rowCount) return res.status(400).json({ error: 'El proveedor no pertenece al almacén activo' });
+    }
     const result = await pool.query(`
-      INSERT INTO products (sku, name, barcode, unit_of_measure, min_stock, category_id, supplier_id)
-      VALUES ($1, $2, NULLIF($3, ''), $4, $5, $6, $7)
+      INSERT INTO products (warehouse_id, sku, name, barcode, unit_of_measure, min_stock, category_id, supplier_id)
+      VALUES ($1, $2, $3, NULLIF($4, ''), $5, $6, $7, $8)
       RETURNING id, sku, name, barcode, unit_of_measure, min_stock, active, category_id, supplier_id
-    `, [sku, name, barcode ?? null, unit_of_measure, min_stock, category_id ?? null, supplier_id ?? null]);
+    `, [warehouseId, sku, name, barcode ?? null, unit_of_measure, min_stock, category_id ?? null, supplier_id ?? null]);
     res.status(201).json(result.rows[0]);
   } catch (error) {
     next(error);
@@ -700,6 +728,7 @@ app.patch('/api/products/:id', requireAdmin, async (req, res, next) => {
   const parsed = productSchema.partial().safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: 'Datos de producto no válidos', details: parsed.error.flatten() });
   const fields = parsed.data;
+  const warehouseId = res.locals.warehouseId as string;
   const updates: string[] = [];
   const values: unknown[] = [];
   for (const key of ['sku', 'name', 'barcode', 'unit_of_measure', 'min_stock', 'category_id', 'supplier_id'] as const) {
@@ -710,10 +739,17 @@ app.patch('/api/products/:id', requireAdmin, async (req, res, next) => {
   }
   if (!updates.length) return res.status(400).json({ error: 'No hay campos que actualizar' });
   try {
+    if (fields.supplier_id) {
+      const supplier = await pool.query(
+        'SELECT id FROM suppliers WHERE id = $1 AND warehouse_id = $2',
+        [fields.supplier_id, warehouseId]
+      );
+      if (!supplier.rowCount) return res.status(400).json({ error: 'El proveedor no pertenece al almacén activo' });
+    }
     values.push(req.params.id);
     const result = await pool.query(
-      `UPDATE products SET ${updates.join(', ')} WHERE id = $${values.length} AND active RETURNING id, sku, name, barcode, unit_of_measure, min_stock, active, category_id, supplier_id`,
-      values
+      `UPDATE products SET ${updates.join(', ')} WHERE id = $${values.length} AND warehouse_id = $${values.length + 1} AND active RETURNING id, sku, name, barcode, unit_of_measure, min_stock, active, category_id, supplier_id`,
+      [...values, warehouseId]
     );
     if (!result.rowCount) return res.status(404).json({ error: 'Producto no encontrado' });
     res.json(result.rows[0]);
@@ -1059,7 +1095,7 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
       if (rack.id) {
         const current = await client.query(`
           SELECT r.id, r.depth_slots,
-                 (SELECT count(*)::int FROM rack_levels WHERE rack_id = r.id) AS level_count,
+                 (SELECT count(*)::int FROM rack_levels WHERE rack_id = r.id AND level_number > 0) AS level_count,
                  COALESCE((SELECT max(bin_count) FROM (
                    SELECT count(*)::int AS bin_count FROM rack_levels rl
                    JOIN bins b ON b.rack_level_id = rl.id WHERE rl.rack_id = r.id
@@ -1086,7 +1122,8 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
         const binWidth = rackBinModuleWidth(rack.map_width, rack.binsPerLevel);
         const binHeight = Math.max(20, Math.floor((rack.map_height - 56) / rack.levelHeights.length) - 8);
         for (const level of levels.rows as { id: string; level_number: number }[]) {
-          await client.query('UPDATE rack_levels SET height_cm = $1 WHERE id = $2', [rack.levelHeights[level.level_number - 1], level.id]);
+          if (level.level_number > 0)
+            await client.query('UPDATE rack_levels SET height_cm = $1 WHERE id = $2', [rack.levelHeights[level.level_number - 1], level.id]);
           const bins = await client.query(`
             SELECT id, width_units, depth_position, substring(code from '-([0-9]+)$')::int AS slot_position
             FROM bins WHERE rack_level_id = $1 ORDER BY depth_position, slot_position
@@ -1165,6 +1202,8 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
             }
           }
         }
+        await addRackFloorBins(client, rackId, codePrefix, rack.code, rack.map_x, rack.map_y,
+          rack.map_width, rack.map_height, rack.levelHeights.length, rack.binsPerLevel, rack.depthSlots);
       }
     }
 
@@ -1205,12 +1244,29 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
 });
 
 app.delete('/api/products/:id', requireAdmin, async (req, res, next) => {
+  const warehouseId = res.locals.warehouseId as string;
+  const client = await pool.connect();
   try {
-    const result = await pool.query('UPDATE products SET active = false WHERE id = $1 AND active RETURNING id', [req.params.id]);
-    if (!result.rowCount) return res.status(404).json({ error: 'Producto no encontrado' });
+    await client.query('BEGIN');
+    const product = await client.query(
+      'SELECT id FROM products WHERE id = $1 AND warehouse_id = $2 AND active FOR UPDATE',
+      [req.params.id, warehouseId]
+    );
+    if (!product.rowCount) throw Object.assign(new Error('Producto no encontrado'), { status: 404 });
+    const pendingLoan = await client.query(
+      'SELECT id FROM in_use_loans WHERE product_id = $1 AND warehouse_id = $2 AND returned_quantity < quantity LIMIT 1',
+      [req.params.id, warehouseId]
+    );
+    if (pendingLoan.rowCount)
+      throw Object.assign(new Error('No se puede archivar: el producto tiene unidades pendientes de devolución'), { status: 409 });
+    await client.query('UPDATE products SET active = false WHERE id = $1', [req.params.id]);
+    await client.query('COMMIT');
     res.status(204).end();
   } catch (error) {
+    await client.query('ROLLBACK');
     next(error);
+  } finally {
+    client.release();
   }
 });
 
@@ -1294,8 +1350,8 @@ app.put('/api/locations/:id/expected-content', requireAdmin, async (req, res, ne
     const productIds = parsed.data.products.map((product) => product.productId);
     if (productIds.length) {
       const activeProducts = await client.query(
-        'SELECT id FROM products WHERE id = ANY($1::uuid[]) AND active',
-        [productIds]
+        'SELECT id FROM products WHERE id = ANY($1::uuid[]) AND warehouse_id = $2 AND active',
+        [productIds, warehouseId]
       );
       if (activeProducts.rowCount !== productIds.length)
         throw Object.assign(new Error('El plan contiene productos inexistentes o inactivos'), { status: 400 });
@@ -1492,7 +1548,7 @@ app.get('/api/racks', async (req, res, next) => {
       JOIN aisles a ON a.id = r.aisle_id
       JOIN zones z ON z.id = a.zone_id
       LEFT JOIN LATERAL (
-        SELECT count(DISTINCT rl.id) AS level_count,
+        SELECT count(DISTINCT rl.id) FILTER (WHERE rl.level_number > 0) AS level_count,
                count(b.id) FILTER (WHERE b.merged_into_bin_id IS NULL) AS bin_count,
                COALESCE((SELECT max(depth_bins.bin_count) FROM (
                  SELECT count(*)::int AS bin_count FROM rack_levels depth_levels
@@ -1501,7 +1557,7 @@ app.get('/api/racks', async (req, res, next) => {
                  GROUP BY depth_levels.id, depth_locations.depth_position
                ) depth_bins), 0) AS bins_per_level,
                COALESCE((SELECT json_agg(rl2.height_cm ORDER BY rl2.level_number)
-                         FROM rack_levels rl2 WHERE rl2.rack_id = r.id), '[]'::json) AS level_heights
+                         FROM rack_levels rl2 WHERE rl2.rack_id = r.id AND rl2.level_number > 0), '[]'::json) AS level_heights
         FROM rack_levels rl
         LEFT JOIN bins b ON b.rack_level_id = rl.id
         WHERE rl.rack_id = r.id
@@ -1592,6 +1648,38 @@ function makeLocationCode(prefix: LocationCodePrefix, rackCode: string, level: n
   return { code, barcode: `LOC-${code}` };
 }
 
+async function addRackFloorBins(
+  client: pg.PoolClient,
+  rackId: string,
+  prefix: LocationCodePrefix,
+  rackCode: string,
+  mapX: number,
+  mapY: number,
+  mapWidth: number,
+  mapHeight: number,
+  levelCount: number,
+  binsPerLevel: number,
+  depthSlots: number
+) {
+  const binWidth = rackBinModuleWidth(mapWidth, binsPerLevel);
+  const binHeight = Math.max(20, Math.floor((mapHeight - 56) / Math.max(1, levelCount)) - 8);
+  const floorLevel = await client.query(
+    'INSERT INTO rack_levels (rack_id, level_number, height_cm) VALUES ($1, 0, 1) RETURNING id',
+    [rackId]
+  );
+  for (let depthPosition = 1; depthPosition <= depthSlots; depthPosition += 1) {
+    for (let position = 1; position <= binsPerLevel; position += 1) {
+      const { code, barcode } = makeLocationCode(prefix, rackCode, 0, position, depthPosition);
+      await client.query(
+        `INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y, map_width, map_height, depth_position)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+        [floorLevel.rows[0].id, code, barcode, mapX + 22 + (position - 1) * (binWidth + 6),
+          mapY + 38, binWidth, binHeight, depthPosition]
+      );
+    }
+  }
+}
+
 async function addRackBins(client: pg.PoolClient, rackId: string, config: z.infer<typeof rackConfigSchema>, prefix: LocationCodePrefix) {
   const binWidth = rackBinModuleWidth(config.map_width, config.binsPerLevel);
   const binHeight = Math.max(20, Math.floor((config.map_height - 56) / config.levelCount) - 8);
@@ -1619,6 +1707,8 @@ async function addRackBins(client: pg.PoolClient, rackId: string, config: z.infe
       }
     }
   }
+  await addRackFloorBins(client, rackId, prefix, config.code, config.map_x, config.map_y,
+    config.map_width, config.map_height, config.levelCount, config.binsPerLevel, config.depthSlots);
 }
 
 app.post('/api/racks', requireAdmin, async (req, res, next) => {
@@ -1673,7 +1763,7 @@ app.patch('/api/racks/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, nex
     const current = await client.query(`
       SELECT r.id, r.code, r.map_x, r.map_y, r.map_width, r.map_height, r.depth_slots, r.aisle_id,
              w.map_width AS warehouse_width, w.map_height AS warehouse_height, w.map_perimeter, w.map_structures,
-             (SELECT count(*)::int FROM rack_levels rl WHERE rl.rack_id = r.id) AS level_count,
+             (SELECT count(*)::int FROM rack_levels rl WHERE rl.rack_id = r.id AND rl.level_number > 0) AS level_count,
              COALESCE((
                SELECT max(level_bins.bin_count) FROM (
                  SELECT count(*)::int AS bin_count FROM rack_levels rl
@@ -1726,7 +1816,7 @@ app.patch('/api/racks/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, nex
     const binWidth = rackBinModuleWidth(config.map_width, config.binsPerLevel);
     const binHeight = Math.max(20, Math.floor((config.map_height - 56) / config.levelCount) - 8);
     for (const level of existingLevels) {
-      if (requestedLevelHeights)
+      if (requestedLevelHeights && level.level_number > 0)
         await client.query('UPDATE rack_levels SET height_cm = $1 WHERE id = $2', [requestedLevelHeights[level.level_number - 1], level.id]);
       const bins = await client.query(`
         SELECT id, width_units, depth_position, substring(code from '-([0-9]+)$')::int AS slot_position
@@ -1852,7 +1942,15 @@ app.get('/api/movements', async (_req, res, next) => {
              COALESCE(string_agg(DISTINCT p.name, ', '), 'Movimiento') AS products,
              COALESCE(sum(ml.quantity), 0)::numeric AS units
       FROM movements m LEFT JOIN movement_lines ml ON ml.movement_id = m.id
-      LEFT JOIN products p ON p.id = ml.product_id
+      LEFT JOIN products p ON p.id = CASE
+        WHEN ml.destination_product_id IS NOT NULL AND EXISTS (
+          SELECT 1 FROM bins destination_bin
+          JOIN rack_levels destination_level ON destination_level.id = destination_bin.rack_level_id
+          JOIN racks destination_rack ON destination_rack.id = destination_level.rack_id
+          JOIN aisles destination_aisle ON destination_aisle.id = destination_rack.aisle_id
+          JOIN zones destination_zone ON destination_zone.id = destination_aisle.zone_id
+          WHERE destination_bin.id = ml.to_bin_id AND destination_zone.warehouse_id = $1
+        ) THEN ml.destination_product_id ELSE ml.product_id END
       WHERE EXISTS (
         SELECT 1 FROM movement_lines scoped
         JOIN bins b ON b.id IN (scoped.from_bin_id, scoped.to_bin_id)
@@ -1869,9 +1967,33 @@ app.get('/api/movements', async (_req, res, next) => {
   }
 });
 
+app.get('/api/in-use', async (_req, res, next) => {
+  try {
+    const result = await pool.query(`
+      SELECT loan.id, loan.product_id, p.sku, p.name,
+             loan.quantity, loan.returned_quantity,
+             (loan.quantity - loan.returned_quantity)::numeric AS remaining_quantity,
+             l.lot_code, m.reference, m.created_at,
+             COALESCE(b.display_name, b.code) AS original_location
+      FROM in_use_loans loan
+      JOIN movement_lines ml ON ml.id = loan.movement_line_id
+      JOIN movements m ON m.id = ml.movement_id
+      JOIN products p ON p.id = loan.product_id
+      LEFT JOIN lots l ON l.id = loan.lot_id
+      JOIN bins b ON b.id = loan.original_bin_id
+      WHERE loan.warehouse_id = $1 AND loan.returned_quantity < loan.quantity
+      ORDER BY loan.created_at, loan.id
+    `, [res.locals.warehouseId]);
+    res.json(result.rows);
+  } catch (error) {
+    next(error);
+  }
+});
+
 const movementSchema = z.object({
-  type: z.enum(['receipt', 'dispatch', 'transfer', 'adjustment']),
-  productId: z.string().uuid(),
+  type: z.enum(['receipt', 'dispatch', 'transfer', 'adjustment', 'in_use', 'return']),
+  productId: z.string().uuid().optional(),
+  loanId: z.string().uuid().optional(),
   lotCode: z.string().trim().min(1).max(100).optional(),
   expiresAt: z.string().refine(
     (value) => !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value,
@@ -1885,9 +2007,11 @@ const movementSchema = z.object({
   destinationWarehouseId: z.string().uuid().optional(),
   reference: z.string().trim().max(120).optional()
 }).superRefine((data, ctx) => {
-  if ((data.type === 'dispatch' || data.type === 'transfer') && !data.fromBinId)
+  if (data.type !== 'return' && !data.productId)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['productId'], message: 'Selecciona un producto' });
+  if ((data.type === 'dispatch' || data.type === 'transfer' || data.type === 'in_use') && !data.fromBinId)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['fromBinId'], message: 'Indica la ubicación de origen' });
-  if ((data.type === 'receipt' || data.type === 'transfer') && !data.toBinId)
+  if ((data.type === 'receipt' || data.type === 'transfer' || data.type === 'return') && !data.toBinId)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['toBinId'], message: 'Indica la ubicación de destino' });
   if (data.type === 'adjustment' && !data.toBinId && !data.fromBinId)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['toBinId'], message: 'Indica una ubicación para el ajuste' });
@@ -1895,8 +2019,16 @@ const movementSchema = z.object({
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['toBinId'], message: 'Un ajuste suma o resta stock en una ubicación, no transfiere entre ubicaciones' });
   if (data.type === 'receipt' && data.fromBinId)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['fromBinId'], message: 'Una entrada solo debe tener ubicación de destino' });
-  if (data.type === 'dispatch' && data.toBinId)
+  if ((data.type === 'dispatch' || data.type === 'in_use') && data.toBinId)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['toBinId'], message: 'Una salida solo debe tener ubicación de origen' });
+  if (data.type === 'return' && !data.loanId)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['loanId'], message: 'Selecciona el artículo pendiente de devolución' });
+  if (data.type === 'return' && data.productId)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['productId'], message: 'La devolución usa el producto asociado al artículo pendiente' });
+  if (data.type !== 'return' && data.loanId)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['loanId'], message: 'Solo una devolución puede indicar un préstamo' });
+  if (data.type === 'return' && (data.fromBinId || data.lotCode || data.expiresAt))
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['loanId'], message: 'La devolución usa el producto y lote del artículo prestado' });
   if (data.binName && !data.toBinId)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['binName'], message: 'El nombre de la caja requiere una ubicación de destino' });
   if (data.binWidthUnits !== undefined && !data.toBinId)
@@ -1928,8 +2060,50 @@ app.post('/api/movements', async (req, res, next) => {
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    const product = await client.query('SELECT id FROM products WHERE id = $1 AND active FOR SHARE', [input.productId]);
-    if (!product.rowCount) throw Object.assign(new Error('Producto no encontrado o inactivo'), { status: 404 });
+    let productId: string;
+    let destinationProductId: string;
+    let loan: { id: string; product_id: string; lot_id: string | null; quantity: string; returned_quantity: string } | undefined;
+    if (input.type === 'return') {
+      const result = await client.query<{
+        id: string; product_id: string; lot_id: string | null; quantity: string; returned_quantity: string
+      }>(`
+        SELECT id, product_id, lot_id, quantity, returned_quantity
+        FROM in_use_loans
+        WHERE id = $1 AND warehouse_id = $2
+        FOR UPDATE
+      `, [input.loanId, warehouseId]);
+      if (!result.rows.length) throw Object.assign(new Error('No se encontró el artículo pendiente en este almacén'), { status: 404 });
+      const loanRow = result.rows[0];
+      loan = loanRow;
+      if (Number(loanRow.returned_quantity) >= Number(loanRow.quantity))
+        throw Object.assign(new Error('Este artículo ya se devolvió por completo'), { status: 409 });
+      if (input.quantity > Number(loanRow.quantity) - Number(loanRow.returned_quantity))
+        throw Object.assign(new Error('La cantidad supera las unidades pendientes de devolución'), { status: 409 });
+      productId = loanRow.product_id;
+      destinationProductId = loanRow.product_id;
+    } else {
+      if (!input.productId) throw Object.assign(new Error('Selecciona un producto'), { status: 400 });
+      productId = input.productId;
+      destinationProductId = productId;
+      const product = await client.query(
+        'SELECT id, sku, unit_of_measure FROM products WHERE id = $1 AND warehouse_id = $2 AND active FOR SHARE',
+        [productId, warehouseId]
+      );
+      if (!product.rowCount) throw Object.assign(new Error('Producto no encontrado o inactivo en el almacén activo'), { status: 404 });
+      if (input.type === 'transfer' && destinationWarehouseId !== warehouseId) {
+        const destinationProduct = await client.query(`
+          SELECT id, unit_of_measure
+          FROM products
+          WHERE sku = $1 AND warehouse_id = $2 AND active
+          FOR SHARE
+        `, [product.rows[0].sku, destinationWarehouseId]);
+        if (!destinationProduct.rowCount)
+          throw Object.assign(new Error(`El SKU ${product.rows[0].sku} no existe en el almacén de destino`), { status: 409 });
+        if (destinationProduct.rows[0].unit_of_measure !== product.rows[0].unit_of_measure)
+          throw Object.assign(new Error('La unidad de medida del SKU no coincide en el almacén de destino'), { status: 409 });
+        destinationProductId = destinationProduct.rows[0].id;
+      }
+    }
 
     const sourceBin = input.fromBinId;
     const destinationBin = input.toBinId;
@@ -1963,15 +2137,20 @@ app.post('/api/movements', async (req, res, next) => {
       await client.query('UPDATE bins SET display_name = $1 WHERE id = $2', [input.binName, destinationBin]);
     }
     const decreasesStock = Boolean(sourceBin);
-    let allocations: { lotId: string | null; quantity: number; balanceId?: string }[] = [];
+    let allocations: {
+      lotId: string | null;
+      quantity: number;
+      balanceId?: string;
+      destinationLotId?: string | null;
+    }[] = [];
     if (decreasesStock) {
       if (destinationBin) {
         await client.query(
           `SELECT id FROM stock_balances
-           WHERE product_id = $1 AND bin_id = ANY($2::uuid[])
+           WHERE product_id = ANY($1::uuid[]) AND bin_id = ANY($2::uuid[])
            ORDER BY bin_id, lot_id NULLS FIRST, id
            FOR UPDATE`,
-          [input.productId, [sourceBin, destinationBin]]
+          [[productId, destinationProductId], [sourceBin, destinationBin]]
         );
       }
       const source = await client.query(
@@ -1981,7 +2160,7 @@ app.post('/api/movements', async (req, res, next) => {
            AND ($3::text IS NULL OR l.lot_code = $3)
          ORDER BY l.received_at ASC NULLS LAST, sb.updated_at ASC, sb.id
          FOR UPDATE OF sb`,
-        [input.productId, sourceBin, input.lotCode ?? null]
+        [productId, sourceBin, input.lotCode ?? null]
       );
       if (input.lotCode && !source.rowCount)
         throw Object.assign(new Error('No hay stock del lote indicado en la ubicación de origen'), { status: 409 });
@@ -2005,6 +2184,8 @@ app.post('/api/movements', async (req, res, next) => {
           [allocation.quantity, allocation.balanceId]
         );
       }
+    } else if (input.type === 'return' && loan) {
+      allocations = [{ lotId: loan.lot_id, quantity: input.quantity }];
     } else {
       let lotId: string | null = null;
       if (input.lotCode) {
@@ -2013,7 +2194,7 @@ app.post('/api/movements', async (req, res, next) => {
            ON CONFLICT (product_id, lot_code)
            DO UPDATE SET expires_at = COALESCE(EXCLUDED.expires_at, lots.expires_at)
            RETURNING id`,
-          [input.productId, input.lotCode, input.expiresAt ?? null]
+          [productId, input.lotCode, input.expiresAt ?? null]
         );
         lotId = lot.rows[0].id;
       }
@@ -2022,13 +2203,30 @@ app.post('/api/movements', async (req, res, next) => {
 
     if (destinationBin) {
       for (const allocation of allocations) {
+        let destinationLotId = allocation.lotId;
+        if (destinationProductId !== productId && allocation.lotId) {
+          const sourceLot = await client.query(
+            'SELECT lot_code, expires_at FROM lots WHERE id = $1',
+            [allocation.lotId]
+          );
+          if (!sourceLot.rowCount) throw new Error('No se pudo encontrar el lote de origen de la transferencia');
+          const destinationLot = await client.query(`
+            INSERT INTO lots (product_id, lot_code, expires_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (product_id, lot_code)
+            DO UPDATE SET expires_at = COALESCE(EXCLUDED.expires_at, lots.expires_at)
+            RETURNING id
+          `, [destinationProductId, sourceLot.rows[0].lot_code, sourceLot.rows[0].expires_at]);
+          destinationLotId = destinationLot.rows[0].id;
+        }
         await client.query(
           `INSERT INTO stock_balances (product_id, lot_id, bin_id, quantity)
            VALUES ($1, $2, $3, $4)
            ON CONFLICT (product_id, lot_id, bin_id)
            DO UPDATE SET quantity = stock_balances.quantity + EXCLUDED.quantity, updated_at = now()`,
-          [input.productId, allocation.lotId, destinationBin, allocation.quantity]
+          [destinationProductId, destinationLotId, destinationBin, allocation.quantity]
         );
+        allocation.destinationLotId = destinationLotId;
       }
     }
 
@@ -2038,11 +2236,38 @@ app.post('/api/movements', async (req, res, next) => {
       [input.type, input.reference ?? null, user.id]
     );
     for (const allocation of allocations) {
-      await client.query(
-        `INSERT INTO movement_lines (movement_id, product_id, lot_id, quantity, from_bin_id, to_bin_id)
-         VALUES ($1, $2, $3, $4, $5, $6)`,
-        [movement.rows[0].id, input.productId, allocation.lotId, allocation.quantity, sourceBin ?? null, destinationBin ?? null]
+      const movementLine = await client.query(
+        `INSERT INTO movement_lines (
+           movement_id, product_id, destination_product_id, lot_id, destination_lot_id,
+           quantity, from_bin_id, to_bin_id
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         RETURNING id`,
+        [
+          movement.rows[0].id,
+          productId,
+          destinationProductId !== productId ? destinationProductId : null,
+          allocation.lotId,
+          destinationProductId !== productId ? allocation.destinationLotId ?? null : null,
+          allocation.quantity,
+          sourceBin ?? null,
+          destinationBin ?? null
+        ]
       );
+      if (input.type === 'in_use') {
+        await client.query(`
+          INSERT INTO in_use_loans (
+            warehouse_id, product_id, lot_id, movement_line_id, original_bin_id, quantity
+          )
+          VALUES ($1, $2, $3, $4, $5, $6)
+        `, [warehouseId, productId, allocation.lotId, movementLine.rows[0].id, sourceBin, allocation.quantity]);
+      }
+      if (input.type === 'return' && loan) {
+        await client.query(
+          'UPDATE in_use_loans SET returned_quantity = returned_quantity + $1 WHERE id = $2',
+          [allocation.quantity, loan.id]
+        );
+      }
     }
     await client.query('COMMIT');
     res.status(201).json({ id: movement.rows[0].id, createdAt: movement.rows[0].created_at });
@@ -2082,10 +2307,11 @@ app.get('/api/replenishment', async (_req, res, next) => {
              COALESCE(i.ordered, 0)::numeric AS on_order,
              GREATEST(p.min_stock - COALESCE(st.available, 0) - COALESCE(i.ordered, 0), 0)::numeric AS suggested_quantity
       FROM products p
-      LEFT JOIN suppliers s ON s.id = p.supplier_id
+      LEFT JOIN suppliers s ON s.id = p.supplier_id AND s.warehouse_id = p.warehouse_id
       LEFT JOIN stock st ON st.product_id = p.id
       LEFT JOIN incoming i ON i.product_id = p.id
-      WHERE p.active AND p.min_stock > COALESCE(st.available, 0) + COALESCE(i.ordered, 0)
+      WHERE p.active AND p.warehouse_id = $1
+        AND p.min_stock > COALESCE(st.available, 0) + COALESCE(i.ordered, 0)
       ORDER BY (p.min_stock - COALESCE(st.available, 0) - COALESCE(i.ordered, 0)) DESC, p.name
     `, [warehouseId]);
     res.json(result.rows);
@@ -2107,9 +2333,9 @@ app.get('/api/purchase-orders', async (_req, res, next) => {
                'quantity', pol.quantity, 'receivedQuantity', pol.received_quantity
              ) ORDER BY p.name) FILTER (WHERE pol.id IS NOT NULL), '[]'::jsonb) AS lines
       FROM purchase_orders po
-      JOIN suppliers s ON s.id = po.supplier_id
+      JOIN suppliers s ON s.id = po.supplier_id AND s.warehouse_id = po.warehouse_id
       LEFT JOIN purchase_order_lines pol ON pol.purchase_order_id = po.id
-      LEFT JOIN products p ON p.id = pol.product_id
+      LEFT JOIN products p ON p.id = pol.product_id AND p.warehouse_id = po.warehouse_id
       WHERE po.warehouse_id = $1
       GROUP BY po.id, s.name
       ORDER BY po.created_at DESC
@@ -2141,9 +2367,9 @@ app.post('/api/purchase-orders', requireAdmin, async (req, res, next) => {
     await client.query('BEGIN');
     const products = await client.query(`
       SELECT id, sku, name, supplier_id
-      FROM products WHERE id = ANY($1::uuid[]) AND active
+      FROM products WHERE id = ANY($1::uuid[]) AND warehouse_id = $2 AND active
       ORDER BY id FOR SHARE
-    `, [parsed.data.lines.map((line) => line.productId)]);
+    `, [parsed.data.lines.map((line) => line.productId), warehouseId]);
     if (products.rowCount !== parsed.data.lines.length)
       throw Object.assign(new Error('Hay productos que no existen o están archivados'), { status: 400 });
     if (products.rows.some((product) => !product.supplier_id))
@@ -2355,7 +2581,8 @@ app.get('/api/sales-orders', async (_req, res, next) => {
                    WHERE soa.sales_order_line_id = sol.id
                  ), '[]'::jsonb)
                ) ORDER BY p.name)
-               FROM sales_order_lines sol JOIN products p ON p.id = sol.product_id
+               FROM sales_order_lines sol
+               JOIN products p ON p.id = sol.product_id AND p.warehouse_id = so.warehouse_id
                WHERE sol.sales_order_id = so.id
              ), '[]'::jsonb) AS lines
       FROM sales_orders so
@@ -2394,8 +2621,8 @@ app.post('/api/sales-orders', async (req, res, next) => {
     const lines = parsed.data.lines;
     const productIds = lines.map((line) => line.productId);
     const activeProducts = await client.query(
-      'SELECT id, name FROM products WHERE id = ANY($1::uuid[]) AND active ORDER BY id FOR SHARE',
-      [productIds]
+      'SELECT id, name FROM products WHERE id = ANY($1::uuid[]) AND warehouse_id = $2 AND active ORDER BY id FOR SHARE',
+      [productIds, warehouseId]
     );
     if (activeProducts.rowCount !== productIds.length)
       throw Object.assign(new Error('Hay productos que no existen o están archivados'), { status: 400 });
@@ -2404,7 +2631,7 @@ app.post('/api/sales-orders', async (req, res, next) => {
       SELECT sb.id, sb.product_id, sb.quantity, sb.reserved_quantity, sb.bin_id, sb.lot_id,
              l.expires_at, l.received_at, p.name
       FROM stock_balances sb
-      JOIN products p ON p.id = sb.product_id AND p.active
+      JOIN products p ON p.id = sb.product_id AND p.active AND p.warehouse_id = $1
       JOIN bins b ON b.id = sb.bin_id
       JOIN rack_levels rl ON rl.id = b.rack_level_id
       JOIN racks r ON r.id = rl.rack_id
@@ -2604,7 +2831,8 @@ app.post('/api/assistant', async (req, res, next) => {
       const context = await pool.query(`
         SELECT p.sku, p.name, p.min_stock,
                concat_ws(' · ', w.name, z.name, 'Pasillo ' || a.code, 'Estantería ' || r.code,
-                 'Nivel ' || lpad(rl.level_number::text, 2, '0'), 'Hueco ' || substring(b.code FROM '[^-]+$')) AS location,
+                 CASE WHEN rl.level_number = 0 THEN 'Suelo' ELSE 'Nivel ' || lpad(rl.level_number::text, 2, '0') END,
+                 'Hueco ' || substring(b.code FROM '[^-]+$')) AS location,
                sb.quantity, sb.reserved_quantity, l.lot_code, l.expires_at
         FROM products p
         LEFT JOIN stock_balances sb ON sb.product_id = p.id
@@ -2615,7 +2843,7 @@ app.post('/api/assistant', async (req, res, next) => {
         LEFT JOIN zones z ON z.id = a.zone_id
         LEFT JOIN warehouses w ON w.id = z.warehouse_id
         LEFT JOIN lots l ON l.id = sb.lot_id
-        WHERE p.active AND z.warehouse_id = $1
+        WHERE p.active AND p.warehouse_id = $1 AND z.warehouse_id = $1
         ORDER BY p.name, l.received_at ASC NULLS LAST
         LIMIT 100
       `, [warehouseId]);
@@ -2656,7 +2884,7 @@ app.post('/api/assistant', async (req, res, next) => {
         LEFT JOIN bins b ON b.id = sb.bin_id LEFT JOIN rack_levels rl ON rl.id = b.rack_level_id
         LEFT JOIN racks r ON r.id = rl.rack_id LEFT JOIN aisles a ON a.id = r.aisle_id
         LEFT JOIN zones z ON z.id = a.zone_id
-        WHERE p.active GROUP BY p.id
+        WHERE p.active AND p.warehouse_id = $1 GROUP BY p.id
         HAVING COALESCE(sum(sb.quantity) FILTER (WHERE z.warehouse_id = $1), 0) <= p.min_stock ORDER BY stock ASC LIMIT 8
       `, [warehouseId]);
       answer = result.rows.length
@@ -2680,14 +2908,15 @@ app.post('/api/assistant', async (req, res, next) => {
       const result = await pool.query(`
         SELECT p.name, p.sku,
                concat_ws(' · ', w.name, z.name, 'Pasillo ' || a.code, 'Estantería ' || r.code,
-                 'Nivel ' || lpad(rl.level_number::text, 2, '0'), 'Hueco ' || substring(b.code FROM '[^-]+$')) AS location,
+                 CASE WHEN rl.level_number = 0 THEN 'Suelo' ELSE 'Nivel ' || lpad(rl.level_number::text, 2, '0') END,
+                 'Hueco ' || substring(b.code FROM '[^-]+$')) AS location,
                sum(sb.quantity)::numeric AS quantity
         FROM products p JOIN stock_balances sb ON sb.product_id = p.id
         JOIN bins b ON b.id = sb.bin_id
         JOIN rack_levels rl ON rl.id = b.rack_level_id JOIN racks r ON r.id = rl.rack_id
         JOIN aisles a ON a.id = r.aisle_id JOIN zones z ON z.id = a.zone_id
         JOIN warehouses w ON w.id = z.warehouse_id
-        WHERE p.active AND z.warehouse_id = $2
+        WHERE p.active AND p.warehouse_id = $2 AND z.warehouse_id = $2
           AND (p.name ILIKE '%' || $1 || '%' OR p.sku ILIKE '%' || $1 || '%')
         GROUP BY p.name, p.sku, w.name, z.name, a.code, r.code, rl.level_number, b.code ORDER BY p.name LIMIT 10
       `, [text.replace(/dónde está|donde esta|ubicación de|ubicacion de|producto|stock|unidades|hay|cuánto|cuanto/g, '').trim(), warehouseId]);
@@ -2807,6 +3036,14 @@ async function start() {
     ));
     await pool.query(readFileSync(
       resolve(apiRoot, 'src/db/migrations/010-rack-depth-and-structures.sql'),
+      'utf8'
+    ));
+    await pool.query(readFileSync(
+      resolve(apiRoot, 'src/db/migrations/011-floor-storage-locations.sql'),
+      'utf8'
+    ));
+    await pool.query(readFileSync(
+      resolve(apiRoot, 'src/db/migrations/012-warehouse-catalog-and-in-use.sql'),
       'utf8'
     ));
     await pool.query(`
