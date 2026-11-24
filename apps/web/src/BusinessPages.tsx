@@ -77,6 +77,7 @@ export type OrderLocation = {
   code: string;
   display_name: string | null;
   quantity: string | number;
+  in_use: boolean;
   warehouse: string;
   zone: string;
   aisle: string;
@@ -131,6 +132,7 @@ export function PurchasingPage({ suggestions, orders, locations, isAdmin, onCrea
   const [receivingOrder, setReceivingOrder] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [selectedBins, setSelectedBins] = useState<Record<string, string>>({});
+  const receivableLocations = locations.filter((location) => !location.in_use);
 
   const createOrder = async () => {
     const lines = suggestions
@@ -204,21 +206,24 @@ export function PurchasingPage({ suggestions, orders, locations, isAdmin, onCrea
           {selectedOrder.lines.map((line) => <tr key={line.id}>
             <td><strong className="table-primary">{line.name}</strong><span className="table-secondary">{line.sku}</span></td>
             <td>{quantity(line.quantity)}</td>
-            <td><select required name={`bin-${line.id}`} defaultValue="" onChange={(event) => setSelectedBins((current) => ({ ...current, [line.id]: event.target.value }))}><option value="" disabled>Selecciona ubicación</option>{locations.map((location) => <option key={location.id} value={location.id}>{location.display_name ? `${location.display_name} · ` : ''}{location.warehouse} · {location.zone} · {location.aisle} · {location.rack} · {location.level_number === 0 ? 'Suelo' : `N${location.level_number}`} · {location.code}</option>)}</select>
-              {locations.find((location) => location.id === selectedBins[line.id] && amount(location.quantity) <= 0) && <label>Nombre de la caja (opcional)<input name={`bin-name-${line.id}`} maxLength={100} placeholder="Ej. Caja azul · tornillería M8" /></label>}
+            <td><select required name={`bin-${line.id}`} defaultValue="" onChange={(event) => setSelectedBins((current) => ({ ...current, [line.id]: event.target.value }))}><option value="" disabled>Selecciona ubicación</option>{receivableLocations.map((location) => <option key={location.id} value={location.id}>{location.display_name ? `${location.display_name} · ` : ''}{location.warehouse} · {location.zone} · {location.aisle} · {location.rack} · {location.level_number === 0 ? 'Suelo' : `N${location.level_number}`} · {location.code}</option>)}</select>
+              {receivableLocations.find((location) => location.id === selectedBins[line.id] && amount(location.quantity) <= 0) && <label>Nombre de la caja (opcional)<input name={`bin-name-${line.id}`} maxLength={100} placeholder="Ej. Caja azul · tornillería M8" /></label>}
             </td>
             <td><input name={`lot-${line.id}`} maxLength={100} placeholder="Lote del fabricante" /></td>
             <td><input name={`expiry-${line.id}`} type="date" /></td>
           </tr>)}
         </tbody></table></div>
-        <div className="business-form-footer"><button type="button" className="button button-secondary" onClick={() => setReceivingOrder(null)}>Cancelar</button><button className="button button-primary" disabled={busy || !locations.length}><ArrowDownLeft size={16} /> {busy ? 'Registrando…' : 'Confirmar recepción completa'}</button></div>
-        {!locations.length && <p className="form-hint">Este almacén no tiene ubicaciones activas donde recibir mercancía.</p>}
+        <div className="business-form-footer"><button type="button" className="button button-secondary" onClick={() => setReceivingOrder(null)}>Cancelar</button><button className="button button-primary" disabled={busy || !receivableLocations.length}><ArrowDownLeft size={16} /> {busy ? 'Registrando…' : 'Confirmar recepción completa'}</button></div>
+        {!receivableLocations.length && <p className="form-hint">{locations.length ? 'Todas las ubicaciones disponibles están reservadas por artículos En uso.' : 'Este almacén no tiene ubicaciones activas donde recibir mercancía.'}</p>}
       </form> : <div className="table-wrap"><table><thead><tr><th>PEDIDO</th><th>PROVEEDOR</th><th>ESTADO</th><th>LÍNEAS / UNIDADES</th><th>FECHA</th><th /></tr></thead><tbody>
         {orders.map((order) => <tr key={order.id}>
           <td><strong className="table-primary">{orderCode('PO', order.id)}</strong></td><td>{order.supplier}</td><td><StatusChip status={order.status} /></td>
           <td>{order.line_count} líneas · {quantity(order.units)} uds.</td><td>{dateLabel(order.created_at)}</td>
           <td><div className="business-actions">
-            {order.status === 'ordered' && <><button className="button button-secondary" disabled={!isAdmin && !locations.length} onClick={() => { setSelectedBins({}); setReceivingOrder(order.id); }}><ArrowDownLeft size={14} /> Recibir</button>{isAdmin && <button className="row-menu" title="Cancelar pedido" aria-label={`Cancelar ${orderCode('PO', order.id)}`} onClick={() => void onCancelOrder(order.id)}><Trash2 size={14} /></button>}</>}
+            {order.status === 'ordered' && <>{isAdmin
+              ? <button className="button button-secondary" disabled={!receivableLocations.length} onClick={() => { setSelectedBins({}); setReceivingOrder(order.id); }}><ArrowDownLeft size={14} /> Recibir</button>
+              : <span className="business-muted">Recepción solo por administrador</span>}
+              {isAdmin && <button className="row-menu" title="Cancelar pedido" aria-label={`Cancelar ${orderCode('PO', order.id)}`} onClick={() => void onCancelOrder(order.id)}><Trash2 size={14} /></button>}</>}
             {order.status !== 'ordered' && <span className="business-muted">{order.status === 'received' ? dateLabel(order.received_at ?? order.created_at) : '—'}</span>}
           </div></td>
         </tr>)}
@@ -229,10 +234,11 @@ export function PurchasingPage({ suggestions, orders, locations, isAdmin, onCrea
   </>;
 }
 
-export function SalesOrdersPage({ orders, products, locations, onCreateOrder, onStartPicking, onFulfill, onCancelOrder }: {
+export function SalesOrdersPage({ orders, products, locations, isAdmin, onCreateOrder, onStartPicking, onFulfill, onCancelOrder }: {
   orders: SalesOrder[];
   products: OrderProduct[];
   locations: OrderLocation[];
+  isAdmin: boolean;
   onCreateOrder: (order: { customerName: string; reference?: string; lines: { productId: string; quantity: number }[] }) => Promise<boolean>;
   onStartPicking: (orderId: string) => Promise<void>;
   onFulfill: (orderId: string) => Promise<void>;
@@ -305,7 +311,9 @@ export function SalesOrdersPage({ orders, products, locations, onCreateOrder, on
             </div>
             <div className="sales-order-card-meta"><span>{order.lines.length} productos · {quantity(order.units)} uds.</span>
               {order.status === 'pending' && <button className="button button-secondary" disabled={busy} onClick={() => { setBusy(true); void onStartPicking(order.id).finally(() => setBusy(false)); }}><ClipboardList size={14} /> Preparar picking</button>}
-              {order.status === 'picking' && <button className="button button-primary" disabled={busy} onClick={() => { setBusy(true); void onFulfill(order.id).finally(() => setBusy(false)); }}><Check size={14} /> Confirmar salida</button>}
+              {order.status === 'picking' && (isAdmin
+                ? <button className="button button-primary" disabled={busy} onClick={() => { setBusy(true); void onFulfill(order.id).finally(() => setBusy(false)); }}><Check size={14} /> Confirmar salida</button>
+                : <span className="business-muted">Salida solo por administrador</span>)}
               {(order.status === 'pending' || order.status === 'picking') && <button className="row-menu" disabled={busy} title="Cancelar pedido" aria-label={`Cancelar pedido de ${order.customer_name}`} onClick={() => { setBusy(true); void onCancelOrder(order.id).finally(() => setBusy(false)); }}><Trash2 size={14} /></button>}
               {order.status === 'fulfilled' && <span className="business-muted">{order.fulfilled_at ? dateLabel(order.fulfilled_at) : ''}</span>}
             </div>

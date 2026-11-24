@@ -45,7 +45,7 @@ type Location = {
   warehouse_id: string; warehouse: string;
   map_x: string | number; map_y: string | number; map_width: string | number; map_height: string | number;
   width_units: number; slot_position: number; depth_position: number;
-  status: string; zone: string; aisle_id: string; aisle: string; rack_id: string; rack: string; level_number: number;
+  status: string; in_use: boolean; zone: string; aisle_id: string; aisle: string; rack_id: string; rack: string; level_number: number;
   quantity: string | number; products: { productId: string; sku: string; name: string; quantity: string | number; lot: string | null }[];
   expected_products: ExpectedProduct[];
 };
@@ -63,7 +63,8 @@ type Movement = {
 type InUseLoan = {
   id: string; product_id: string; sku: string; name: string;
   quantity: string | number; returned_quantity: string | number; remaining_quantity: string | number;
-  lot_code: string | null; reference: string | null; created_at: string; original_location: string;
+  lot_code: string | null; reference: string | null; created_at: string;
+  original_bin_id: string; original_location: string;
 };
 type EmployeeMovementAlert = Movement & {
   user_id: string; user_name: string; user_email: string; unread: boolean;
@@ -779,10 +780,10 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
             try { await request(`/products/${id}`, { method: 'DELETE' }); await refresh(); notify('Producto archivado'); }
             catch (reason) { setError(reason instanceof Error ? reason.message : 'No se pudo archivar'); }
           }} />}
-          {page === 'map' && warehouseMap && <MapPage products={products} locations={locations} racks={racks} warehouse={warehouseMap} aisles={aisles} selected={selectedLocation} initialRackId={qrRackId} isAdmin={isAdmin} onSelect={setSelectedLocation} onRefresh={refresh} onNotify={notify} onMoveStock={(location) => { setMovementDefaults({ type: 'transfer', fromBinId: location.id }); setMovementError(''); setModal('movement'); }} onSaveExpected={saveExpectedContent} onSaveLocationName={saveLocationName} onEditingChange={setMapEditing} />}
+          {page === 'map' && warehouseMap && <MapPage products={products} locations={locations} racks={racks} warehouse={warehouseMap} aisles={aisles} selected={selectedLocation} initialRackId={qrRackId} isAdmin={isAdmin} onSelect={setSelectedLocation} onRefresh={refresh} onNotify={notify} onMoveStock={(location) => { setMovementDefaults({ type: isAdmin ? 'transfer' : 'in_use', fromBinId: location.id }); setMovementError(''); setModal('movement'); }} onSaveExpected={saveExpectedContent} onSaveLocationName={saveLocationName} onEditingChange={setMapEditing} />}
           {page === 'movements' && <MovementsPage movements={movements} onAdd={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onExport={() => downloadCsv('movimientos.csv', [['Tipo', 'Referencia', 'Productos', 'Unidades', 'Fecha'], ...movements.map((item) => [movementNames[item.type] ?? item.type, item.reference, item.products, item.units, item.created_at])])} />}
           {page === 'purchasing' && <PurchasingPage suggestions={replenishment} orders={purchaseOrders} locations={locations} isAdmin={isAdmin} onCreateOrder={createPurchaseOrders} onReceiveOrder={receivePurchaseOrder} onCancelOrder={cancelPurchaseOrder} />}
-          {page === 'salesOrders' && <SalesOrdersPage orders={salesOrders} products={products} locations={locations} onCreateOrder={createSalesOrder} onStartPicking={(id) => changeSalesOrder(id, 'picking')} onFulfill={(id) => changeSalesOrder(id, 'fulfill')} onCancelOrder={(id) => changeSalesOrder(id, 'cancel')} />}
+          {page === 'salesOrders' && <SalesOrdersPage orders={salesOrders} products={products} locations={locations} isAdmin={isAdmin} onCreateOrder={createSalesOrder} onStartPicking={(id) => changeSalesOrder(id, 'picking')} onFulfill={(id) => changeSalesOrder(id, 'fulfill')} onCancelOrder={(id) => changeSalesOrder(id, 'cancel')} />}
           {page === 'assistant' && <AssistantPage />}
           {page === 'settings' && <SettingsPage user={user} users={users} categories={categories} suppliers={suppliers} employeeMovementAlerts={employeeMovementAlerts} unreadEmployeeMovementAlerts={unreadEmployeeMovementAlerts} isAdmin={isAdmin} onAddUser={() => setModal('employee')} onToggleUser={(entry) => void toggleEmployee(entry)} onChangePassword={changePassword} onCreateCatalogEntry={createCatalogEntry} onDeleteCatalogEntry={deleteCatalogEntry} onMarkEmployeeAlertsRead={() => void markEmployeeAlertsRead()} />}
         </div>
@@ -794,7 +795,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
             ? <EmployeeForm onSubmit={saveEmployee} onCancel={() => setModal(null)} />
         : modal === 'warehouse'
           ? <WarehouseForm onSubmit={saveWarehouse} onCancel={() => setModal(null)} />
-          : <MovementForm key={`${movementDefaults?.type ?? 'receipt'}-${movementDefaults?.fromBinId ?? 'new'}`} products={products} locations={locations} racks={racks} warehouses={warehouses} inUseLoans={inUseLoans} currentWarehouseId={selectedWarehouseId ?? ''} initialType={movementDefaults?.type} initialFromBinId={movementDefaults?.fromBinId} saving={movementSaving} onSubmit={saveMovement} onCancel={() => { setModal(null); setMovementDefaults(null); setMovementError(''); }} />}
+          : <MovementForm key={`${movementDefaults?.type ?? 'receipt'}-${movementDefaults?.fromBinId ?? 'new'}`} products={products} locations={locations} racks={racks} warehouses={warehouses} inUseLoans={inUseLoans} currentWarehouseId={selectedWarehouseId ?? ''} isAdmin={isAdmin} initialType={movementDefaults?.type} initialFromBinId={movementDefaults?.fromBinId} saving={movementSaving} onSubmit={saveMovement} onCancel={() => { setModal(null); setMovementDefaults(null); setMovementError(''); }} />}
       </Modal>}
       {toast && <div className="toast"><Check size={17} />{toast}</div>}
     </div>
@@ -1262,23 +1263,24 @@ function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin,
   }, [currentBin?.id, currentBin?.display_name]);
 
   return <>
-    <PageIntro eyebrow="VISTA 3D" title={rack.name} description={`${rack.code} · ${rack.level_count} niveles · ${rack.bins_per_level} huecos por nivel`} actions={<>
+    <PageIntro eyebrow="VISTA 3D" title={rack.name} description={`${rack.level_count} niveles · ${rack.bins_per_level} huecos por nivel`} actions={<>
       {editing && <><button className="button button-secondary" disabled={saving} onClick={onDiscard}>Descartar cambios</button><button className="button button-primary" disabled={saving} onClick={onSave}><Check size={15} />{saving ? 'Guardando…' : 'Guardar y salir'}</button></>}
       {!editing && isAdmin && <button className="button button-secondary" onClick={() => setQrLabelsOpen(true)}><QrCode size={15} /> Imprimir etiquetas QR</button>}
       <button className="button button-secondary" onClick={onBack}><ArrowLeft size={15} /> {editing ? 'Volver al editor 2D' : 'Volver al mapa 2D'}</button>
     </>} />
     <section className="rack3d-layout">
       <div className="panel rack3d-panel">
-        <div className="rack3d-heading"><div><span className="eyebrow">ESTANTERÍA INDUSTRIAL · VISTA 3D</span><h2>{rack.code}</h2><p>Selecciona un paquete para consultar el producto y su ubicación.</p></div></div>
+        <div className="rack3d-heading"><div><span className="eyebrow">ESTANTERÍA INDUSTRIAL · VISTA 3D</span><h2>{rack.name}</h2><p>Selecciona un paquete para consultar el producto y su ubicación.</p></div></div>
         <div className="rack3d-stage"><Suspense fallback={<div className="rack3d-loading">Cargando visor 3D…</div>}><RackViewer3D rack={rack} locations={locations} selectedId={selected?.id ?? null} showFloorLocations={!qrLabelsOpen} showLocationLabels={!qrLabelsOpen} onSelectProduct={(_products, location) => {
           onSelect(locations.find((item) => item.id === location.id) ?? null);
         }} /></Suspense></div>
       </div>
       <aside className="panel rack3d-detail">
         {editing && isAdmin ? <><div className="location-heading"><div><span className="eyebrow">CONFIGURACIÓN</span><h2>Estantería</h2></div></div><RackConfigForm rack={rack} onChange={onChange} onDelete={onDelete} /></>
-          : currentBin ? <><div className="location-heading"><div><span className="eyebrow">CAJA</span><h2>{currentBin.display_name || currentBin.code}</h2><small>{currentBin.code}</small></div><span className="rack3d-unit-pill">{formatNumber(currentBin.quantity)} uds.</span></div><div className="rack3d-detail-content">
+          : currentBin ? <><div className="location-heading"><div><span className="eyebrow">CAJA</span><h2>{currentBin.display_name || currentBin.code}</h2><small>{currentBin.code}</small></div><span className={`rack3d-unit-pill ${currentBin.in_use ? 'in-use' : ''}`}>{currentBin.in_use ? 'En uso' : `${formatNumber(currentBin.quantity)} uds.`}</span></div><div className="rack3d-detail-content">
+              {currentBin.in_use && <div className="in-use-location-notice">Esta ubicación está reservada. Devuelve aquí los artículos pendientes; no se puede almacenar nada más.</div>}
               <h3>Existencias reales</h3>{currentBin.products.filter((product) => number(product.quantity) > 0).map((product) => <div className="location-product" key={`${product.productId}-${product.lot}`}><span className="product-thumb thumb-0"><Package size={16} /></span><span><strong>{product.name}</strong><small>{product.sku}{product.lot ? ` · Lote ${product.lot}` : ''}</small></span><b>{formatNumber(product.quantity)} uds.</b></div>)}
-              {!currentBin.products.some((product) => number(product.quantity) > 0) && <div className="location-empty">Este hueco está vacío.</div>}
+              {!currentBin.products.some((product) => number(product.quantity) > 0) && <div className="location-empty">{currentBin.in_use ? 'El artículo está en uso y el hueco queda reservado.' : 'Este hueco está vacío.'}</div>}
             </div>{showExpectedContent && <ExpectedContentsPanel location={currentBin} />}
             {isAdmin && <form className="bin-name-editor" onSubmit={(event) => {
               event.preventDefault();
@@ -1527,7 +1529,9 @@ export function LegacyMapPage({ locations, racks, selected, isAdmin, onSelect, o
     }
   };
 
-  const occupied = locations.filter((l) => number(l.quantity) > 0).length;
+  const occupied = locations.filter((location) => number(location.quantity) > 0).length;
+  const inUse = locations.filter((location) => location.in_use).length;
+  const available = locations.filter((location) => number(location.quantity) <= 0 && !location.in_use).length;
   const canvasWidth = Math.max(520, ...racks.map((rack) => number(rackDraft[rack.id]?.x ?? rack.map_x) + number(rack.map_width) + 45));
   const canvasHeight = Math.max(340, ...racks.map((rack) => number(rackDraft[rack.id]?.y ?? rack.map_y) + number(rack.map_height) + 45));
   const selectedRack = racks.find((rack) => rack.id === selectedRackId) ?? null;
@@ -1542,7 +1546,7 @@ export function LegacyMapPage({ locations, racks, selected, isAdmin, onSelect, o
 
   return <>
     <PageIntro eyebrow="LAYOUT Y UBICACIONES" title="Mapa del almacén" description="Arrastra estanterías al plano, colócalas y configura sus niveles y ubicaciones." actions={<><button className="button button-secondary" onClick={() => downloadCsv('ubicaciones.csv', [['Ubicación', 'Zona', 'Pasillo', 'Estantería', 'Nivel', 'Unidades'], ...locations.map((location) => [location.code, location.zone, location.aisle, location.rack, location.level_number === 0 ? 'Suelo' : location.level_number, location.quantity])])}><Download size={16} /> Exportar CSV</button>{isAdmin && (editMode ? <><button className="button button-secondary" onClick={() => { setEditMode(false); setRackDraft(Object.fromEntries(racks.map((rack) => [rack.id, { x: number(rack.map_x), y: number(rack.map_y) }]))); }}>Cancelar</button><button className="button button-primary" disabled={saving} onClick={() => void saveLayout()}><Check size={16} /> {saving ? 'Guardando…' : 'Guardar plano'}</button></> : <button className="button button-primary" onClick={() => setEditMode(true)}><Pencil size={15} /> Editar plano</button>)}</>} />
-    <div className="map-summary"><div className="map-summary-item"><span className="map-dot occupied" />Ubicaciones ocupadas <strong>{occupied}</strong></div><div className="map-summary-item"><span className="map-dot available" />Vacías <strong>{locations.length - occupied}</strong></div><div className="map-summary-item"><Layers size={14} />Estanterías <strong>{racks.length}</strong></div><div className="map-summary-spacer" /><div className="map-floor"><Building2 size={15} /> Madrid · Planta principal</div></div>
+    <div className="map-summary"><div className="map-summary-item"><span className="map-dot occupied" />Ubicaciones ocupadas <strong>{occupied}</strong></div><div className="map-summary-item"><span className="map-dot in-use" />En uso <strong>{inUse}</strong></div><div className="map-summary-item"><span className="map-dot available" />Vacías <strong>{available}</strong></div><div className="map-summary-item"><Layers size={14} />Estanterías <strong>{racks.length}</strong></div><div className="map-summary-spacer" /><div className="map-floor"><Building2 size={15} /> Madrid · Planta principal</div></div>
     <div className="map-layout">
       {isAdmin && editMode && <aside className="map-toolbox panel"><span className="eyebrow">ELEMENTOS</span><h3>Plano del almacén</h3><div className="map-tool-hint">Arrastra una estantería y suéltala donde quieras en el plano.</div><div className="rack-template" draggable onDragStart={(event) => event.dataTransfer.setData('application/stockflow-rack', 'new')}><div className="rack-template-icon"><Layers size={19} /></div><span><strong>Estantería</strong><small>3 niveles · 4 ubicaciones</small></span><Plus size={16} /></div><div className="map-tool-note"><ShieldCheck size={14} /> Las posiciones se guardan en la base de datos.</div></aside>}
       <section className="panel map-panel"><div className="map-panel-heading"><div><h2>Plano de planta</h2><p>{racks.length} estanterías <span>·</span> {locations.length} ubicaciones</p></div><div className="zoom-controls"><button aria-label="Alejar" title="Alejar" onClick={() => setZoom((value) => Math.max(.5, Math.round((value - .1) * 10) / 10))}><ZoomOut size={15} /></button><span>{Math.round(zoom * 100)}%</span><button aria-label="Acercar" title="Acercar" onClick={() => setZoom((value) => Math.min(1.6, Math.round((value + .1) * 10) / 10))}><ZoomIn size={15} /></button></div></div>
@@ -1554,11 +1558,11 @@ export function LegacyMapPage({ locations, racks, selected, isAdmin, onSelect, o
                 const position = rackDraft[rack.id] ?? { x: number(rack.map_x), y: number(rack.map_y) };
                 const bins = locations.filter((location) => location.rack_id === rack.id);
                 const levels = [0, ...Array.from({ length: rack.level_count }, (_, index) => index + 1)];
-                return <div key={rack.id} role="group" tabIndex={0} aria-label={`Estantería ${rack.code}`} className={`map-rack ${selectedRackId === rack.id ? 'selected' : ''} ${editMode && isAdmin ? 'draggable' : ''}`} style={{ left: position.x, top: position.y, width: number(rack.map_width), height: number(rack.map_height) }} onPointerDown={(event) => moveRack(event, rack)} onPointerMove={updateRackPosition} onPointerUp={() => setDragging(null)} onPointerCancel={() => setDragging(null)} onClick={() => { setSelectedRackId(rack.id); onSelect(null); }} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setSelectedRackId(rack.id); }}>
-                  <div className="map-rack-heading"><Layers size={15} /><strong>{rack.code}</strong><span>{rack.name}</span><small>{formatNumber(rack.units)} uds.</small></div>
+                return <div key={rack.id} role="group" tabIndex={0} aria-label={`Estantería ${rack.name}`} className={`map-rack ${selectedRackId === rack.id ? 'selected' : ''} ${editMode && isAdmin ? 'draggable' : ''}`} style={{ left: position.x, top: position.y, width: number(rack.map_width), height: number(rack.map_height) }} onPointerDown={(event) => moveRack(event, rack)} onPointerMove={updateRackPosition} onPointerUp={() => setDragging(null)} onPointerCancel={() => setDragging(null)} onClick={() => { setSelectedRackId(rack.id); onSelect(null); }} onKeyDown={(event) => { if (event.key === 'Enter' || event.key === ' ') setSelectedRackId(rack.id); }}>
+                  <div className="map-rack-heading"><Layers size={15} /><strong>{rack.name}</strong><small>{formatNumber(rack.units)} uds.</small></div>
                   <div className="rack-shelves">{levels.map((level) => {
                     const levelBins = bins.filter((bin) => bin.level_number === level);
-                    return <div className="rack-shelf-row" key={level}><span className="shelf-level">{level === 0 ? 'Suelo' : String(level).padStart(2, '0')}</span><div className="rack-bin-list">{levelBins.map((bin) => <button key={bin.id} className={`rack-bin ${number(bin.quantity) > 0 ? 'filled' : ''} ${selected?.id === bin.id ? 'active' : ''}`} title={`${bin.code} · ${formatNumber(bin.quantity)} unidades`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); setSelectedRackId(rack.id); onSelect(bin); }}>{bin.code.split('-').slice(-1)[0]}<small>{number(bin.quantity) > 0 ? formatNumber(bin.quantity) : '·'}</small></button>)}</div></div>;
+                    return <div className="rack-shelf-row" key={level}><span className="shelf-level">{level === 0 ? 'Suelo' : String(level).padStart(2, '0')}</span><div className="rack-bin-list">{levelBins.map((bin) => <button key={bin.id} className={`rack-bin ${number(bin.quantity) > 0 ? 'filled' : ''} ${bin.in_use ? 'in-use' : ''} ${selected?.id === bin.id ? 'active' : ''}`} title={`${bin.code} · ${bin.in_use ? 'En uso · ubicación reservada' : `${formatNumber(bin.quantity)} unidades`}`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); setSelectedRackId(rack.id); onSelect(bin); }}>{bin.code.split('-').slice(-1)[0]}<small>{bin.in_use ? 'USO' : number(bin.quantity) > 0 ? formatNumber(bin.quantity) : '·'}</small></button>)}</div></div>;
                   })}</div>
                 </div>;
               })}
@@ -1569,26 +1573,28 @@ export function LegacyMapPage({ locations, racks, selected, isAdmin, onSelect, o
         <div className="map-footer"><span><ShieldCheck size={15} /> Datos sincronizados en tiempo real</span><span>Última actualización: ahora</span></div>
       </section>
       <aside className="panel location-panel">
-        {selectedRack ? <><div className="location-heading"><div><span className="eyebrow">ESTANTERÍA</span><h2>{selectedRack.code}</h2></div><button className="icon-button" aria-label="Cerrar estantería" onClick={() => { setSelectedRackId(null); onSelect(null); }}><X size={17} /></button></div>
+        {selectedRack ? <><div className="location-heading"><div><span className="eyebrow">ESTANTERÍA</span><h2>{selectedRack.name}</h2></div><button className="icon-button" aria-label="Cerrar estantería" onClick={() => { setSelectedRackId(null); onSelect(null); }}><X size={17} /></button></div>
           <div className="location-path"><Map size={15} />{selectedRack.zone} <ChevronRight size={13} /> Pasillo {selectedRack.aisle} <ChevronRight size={13} /> {selectedRack.name}</div>
           <div className="location-stats"><div><span>Niveles</span><strong>{selectedRack.level_count}</strong></div><div><span>Ubicaciones</span><strong>{selectedRack.bin_count}</strong></div></div>
           <div className="rack-detail-actions">{isAdmin && <button className="button button-secondary" onClick={() => setEditMode((editing) => !editing)}><Settings2 size={15} /> {editMode ? 'Ocultar ajustes' : 'Configurar estantería'}</button>}</div>
           {isAdmin && editMode && <RackConfigForm key={`${selectedRack.id}-${selectedRack.code}-${selectedRack.map_width}-${selectedRack.map_height}`} rack={selectedRack} onChange={() => undefined} onDelete={() => undefined} />}
           <div className="location-products-heading"><h3>Ubicaciones por nivel</h3><span>{selectedRack.bin_count}</span></div>
-          <div className="rack-bin-details">{rackLevels.map(({ level, bins }) => <section key={level}><strong className="rack-level-title">{level === 0 ? 'Suelo' : `Nivel ${level}`}</strong>{bins.map((bin) => <button className={`rack-bin-detail ${selected?.id === bin.id ? 'selected' : ''}`} key={bin.id} onClick={() => onSelect(bin)}><span><strong>{bin.code}</strong><small>Fondo {bin.depth_position} · {bin.products.length ? bin.products.map((product) => product.name).join(', ') : 'Disponible'}</small></span><b>{formatNumber(bin.quantity)} uds.</b></button>)}</section>)}</div>
+          <div className="rack-bin-details">{rackLevels.map(({ level, bins }) => <section key={level}><strong className="rack-level-title">{level === 0 ? 'Suelo' : `Nivel ${level}`}</strong>{bins.map((bin) => <button className={`rack-bin-detail ${bin.in_use ? 'in-use' : ''} ${selected?.id === bin.id ? 'selected' : ''}`} key={bin.id} onClick={() => onSelect(bin)}><span><strong>{bin.code}{bin.in_use && <small className="in-use-badge">En uso</small>}</strong><small>Fondo {bin.depth_position} · {bin.products.length ? bin.products.map((product) => product.name).join(', ') : bin.in_use ? 'Ubicación reservada' : 'Disponible'}</small></span><b>{formatNumber(bin.quantity)} uds.</b></button>)}</section>)}</div>
           {selected && <div className="selected-bin-card"><div className="location-products-heading"><h3>Ubicación {selected.code}</h3><span>{selected.products.length} productos</span></div>
+            {selected.in_use && <div className="in-use-location-notice">En uso: esta ubicación está reservada para la devolución del artículo original.</div>}
             <div className="location-products">{selected.products.map((product) => <div className="location-product" key={`${product.productId}-${product.lot}`}><div className="product-thumb thumb-0"><Package size={16} /></div><div><strong>{product.name}</strong><small>{product.sku}{product.lot ? ` · Lote ${product.lot}` : ''}</small></div><b>{formatNumber(product.quantity)} uds.</b></div>)}
-              {!selected.products.length && <div className="location-empty">Esta ubicación está disponible.</div>}
+              {!selected.products.length && <div className="location-empty">{selected.in_use ? 'El hueco está reservado mientras el artículo siga en uso.' : 'Esta ubicación está disponible.'}</div>}
             </div><button className="button button-primary full-button" disabled={!selected.products.length} onClick={() => onMoveStock(selected)}><ArrowLeftRight size={16} /> Mover stock</button>
           </div>}
         </> : selected ? <><div className="location-heading"><div><span className="eyebrow">DETALLE DE UBICACIÓN</span><h2>{selected.code}</h2></div><button className="icon-button" aria-label="Cerrar detalle" onClick={() => onSelect(null)}><X size={17} /></button></div>
           <div className="location-path"><Map size={15} />{selected.zone} <ChevronRight size={13} /> Pasillo {selected.aisle} <ChevronRight size={13} /> {selected.level_number === 0 ? 'Suelo' : `Nivel ${selected.level_number}`}</div>
           <div className="location-stats"><div><span>Unidades</span><strong>{formatNumber(selected.quantity)}</strong></div><div><span>Capacidad</span><strong>{selected.capacity ? `${formatNumber(selected.capacity)} uds.` : 'Sin límite'}</strong></div></div>
-          <div className="occupancy-label"><span>Ocupación</span><strong>{selected.capacity ? `${Math.min(100, Math.round(number(selected.quantity) / number(selected.capacity) * 100))}%` : number(selected.quantity) > 0 ? 'En uso' : 'Vacía'}</strong></div>
+          {selected.in_use && <div className="in-use-location-notice">En uso: ubicación reservada; las devoluciones deben volver aquí.</div>}
+          <div className="occupancy-label"><span>Ocupación</span><strong>{selected.in_use ? 'En uso' : selected.capacity ? `${Math.min(100, Math.round(number(selected.quantity) / number(selected.capacity) * 100))}%` : number(selected.quantity) > 0 ? 'En uso' : 'Vacía'}</strong></div>
           <div className="occupancy-track"><span style={{ width: `${selected.capacity ? Math.min(100, number(selected.quantity) / number(selected.capacity) * 100) : number(selected.quantity) ? 58 : 0}%` }} /></div>
           <div className="location-products-heading"><h3>Productos almacenados</h3><span>{selected.products.length}</span></div>
           <div className="location-products">{selected.products.map((p) => <div className="location-product" key={`${p.productId}-${p.lot}`}><div className="product-thumb thumb-0"><Package size={16} /></div><div><strong>{p.name}</strong><small>{p.sku}{p.lot ? ` · Lote ${p.lot}` : ''}</small></div><b>{formatNumber(p.quantity)} uds.</b></div>)}
-            {!selected.products.length && <div className="location-empty">Esta ubicación está disponible para almacenar productos.</div>}
+            {!selected.products.length && <div className="location-empty">{selected.in_use ? 'El hueco está reservado mientras el artículo siga en uso.' : 'Esta ubicación está disponible para almacenar productos.'}</div>}
           </div>
           <button className="button button-primary full-button" disabled={!selected.products.length} onClick={() => onMoveStock(selected)}><ArrowLeftRight size={16} /> Mover stock</button>
         </> : <div className="location-placeholder"><div className="placeholder-icon"><Map size={21} /></div><h3>Selecciona una estantería</h3><p>Haz clic en el mapa para consultar y configurar sus niveles y ubicaciones.</p></div>}
@@ -1975,6 +1981,8 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
   const selectedRack: Rack | null = activeRacks.find((rack) => rack.id === selectedRackId) ?? null;
   const rackLocations = selectedRack ? locations.filter((location) => location.rack_id === selectedRack.id) : [];
   const occupied = locations.filter((location) => number(location.quantity) > 0).length;
+  const inUse = locations.filter((location) => location.in_use).length;
+  const available = locations.filter((location) => number(location.quantity) <= 0 && !location.in_use).length;
   const zoomedWidth = Math.round(canvasWidth * MAP_RENDER_SCALE * zoom);
   const zoomedHeight = Math.round(canvasHeight * MAP_RENDER_SCALE * zoom);
   const startPerimeterEdit = () => {
@@ -2015,7 +2023,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
       <button className="button button-secondary" onClick={() => downloadCsv('ubicaciones.csv', [['Ubicación', 'Zona', 'Pasillo', 'Estantería', 'Nivel', 'Unidades'], ...locations.map((location) => [location.code, location.zone, location.aisle, location.rack, location.level_number === 0 ? 'Suelo' : location.level_number, location.quantity])])}><Download size={16} /> Exportar CSV</button>
       {isAdmin && (editMode ? <><button className="button button-secondary" disabled={saving} onClick={discardChanges}>Descartar cambios</button><button className="button button-primary" disabled={saving || drawingPerimeter || drawingStructureType !== null} title={drawingPerimeter || drawingStructureType ? 'Finaliza o cancela el dibujo activo' : undefined} onClick={() => void saveLayout()}><Check size={16} /> {saving ? 'Guardando…' : 'Guardar y salir'}</button></> : <button className="button button-primary" onClick={startEditing}><Pencil size={15} /> Editar plano</button>)}
     </>} />
-    <div className="map-summary"><div className="map-summary-item"><span className="map-dot occupied" />Ubicaciones ocupadas <strong>{occupied}</strong></div><div className="map-summary-item"><span className="map-dot available" />Vacías <strong>{locations.length - occupied}</strong></div><div className="map-summary-item"><Layers size={14} />Estanterías <strong>{activeRacks.length}</strong></div><div className="map-summary-spacer" /><div className="map-floor"><Building2 size={15} /> {warehouse.name}</div></div>
+    <div className="map-summary"><div className="map-summary-item"><span className="map-dot occupied" />Ubicaciones ocupadas <strong>{occupied}</strong></div><div className="map-summary-item"><span className="map-dot in-use" />En uso <strong>{inUse}</strong></div><div className="map-summary-item"><span className="map-dot available" />Vacías <strong>{available}</strong></div><div className="map-summary-item"><Layers size={14} />Estanterías <strong>{activeRacks.length}</strong></div><div className="map-summary-spacer" /><div className="map-floor"><Building2 size={15} /> {warehouse.name}</div></div>
     <div className="map-layout">
       {isAdmin && editMode && <aside className="map-toolbox panel"><span className="eyebrow">PLANO DEL ALMACÉN</span><h3>Dimensiones</h3>
         <div className="warehouse-dimensions"><label>Ancho (cm)<input type="number" min="520" max="30000" step="50" value={number(warehouseDraft.map_width)} onChange={(event) => setWarehouseDraft((current) => ({ ...current, map_width: Number(event.target.value) }))} /></label><label>Fondo (cm)<input type="number" min="340" max="30000" step="50" value={number(warehouseDraft.map_height)} onChange={(event) => setWarehouseDraft((current) => ({ ...current, map_height: Number(event.target.value) }))} /></label></div>
@@ -2193,16 +2201,18 @@ function ProductForm({ initial, categories, suppliers, onSubmit, onCancel }: { i
   </form>;
 }
 
-function MovementForm({ products, locations, racks, warehouses, inUseLoans, currentWarehouseId, initialType, initialFromBinId, saving, onSubmit, onCancel }: {
+function MovementForm({ products, locations, racks, warehouses, inUseLoans, currentWarehouseId, isAdmin, initialType, initialFromBinId, saving, onSubmit, onCancel }: {
   products: Product[]; locations: Location[]; racks: Rack[]; warehouses: Warehouse[];
   inUseLoans: InUseLoan[];
-  currentWarehouseId: string; initialType?: string; initialFromBinId?: string;
+  currentWarehouseId: string; isAdmin: boolean; initialType?: string; initialFromBinId?: string;
   saving: boolean;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void; onCancel: () => void
 }) {
   type MovementType = 'receipt' | 'dispatch' | 'transfer' | 'adjustment' | 'in_use' | 'return';
   type LocationRole = 'from' | 'to';
-  const [type, setType] = useState<MovementType>((initialType as MovementType | undefined) ?? 'receipt');
+  const [type, setType] = useState<MovementType>(
+    isAdmin ? (initialType as MovementType | undefined) ?? 'receipt' : initialType === 'return' ? 'return' : 'in_use'
+  );
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [adjustmentDirection, setAdjustmentDirection] = useState<'increase' | 'decrease'>('increase');
   const [productId, setProductId] = useState('');
@@ -2262,6 +2272,8 @@ function MovementForm({ products, locations, racks, warehouses, inUseLoans, curr
   const eligibleLocations = availableLocations.filter((location) => {
     if (location.status !== 'active') return false;
     if (locationRole === 'from') return hasProduct(location);
+    if (type === 'return') return location.id === selectedLoan?.original_bin_id;
+    if (location.in_use) return false;
     if (location.id === fromBinId) return false;
     return hasProduct(location) || isEmpty(location);
   });
@@ -2363,7 +2375,9 @@ function MovementForm({ products, locations, racks, warehouses, inUseLoans, curr
         setLocationRole(event.target.value === 'receipt' || event.target.value === 'return' ? 'to' : 'from');
         setDestinationWarehouseId(currentWarehouseId);
         setAdjustmentDirection('increase');
-      }}><option value="receipt">Entrada</option><option value="dispatch">Salida</option><option value="transfer">Transferencia</option><option value="adjustment">Ajuste de inventario</option><option value="in_use">En uso</option><option value="return">Devolución</option></select></label>
+      }}>{isAdmin
+        ? <><option value="receipt">Entrada</option><option value="dispatch">Salida</option><option value="transfer">Transferencia</option><option value="adjustment">Ajuste de inventario</option><option value="in_use">En uso</option><option value="return">Devolución</option></>
+        : <><option value="in_use">En uso</option><option value="return">Devolución</option></>}</select></label>
       {type === 'adjustment' && <label>Tipo de ajuste<select value={adjustmentDirection} onChange={(event) => setAdjustmentDirection(event.target.value as 'increase' | 'decrease')}><option value="increase">Incrementar stock</option><option value="decrease">Descontar stock</option></select></label>}
       <p className="form-hint">{type === 'transfer' ? 'Se elegirán primero la ubicación de origen y después la de destino. El mismo SKU debe existir en ambos almacenes.' : type === 'in_use' ? 'Se descontará el artículo del stock disponible y quedará pendiente de devolución.' : type === 'return' ? 'Elige un artículo pendiente; puedes registrar una devolución parcial.' : 'A continuación elegirás el producto y su ubicación en el almacén.'}</p>
       <div className="form-actions"><button type="button" className="button button-secondary" onClick={onCancel}>Cancelar</button><button type="button" className="button button-primary" onClick={() => setStep(2)}>Continuar <ChevronRight size={15} /></button></div>
@@ -2404,7 +2418,7 @@ function MovementForm({ products, locations, racks, warehouses, inUseLoans, curr
             : 'No hay ubicaciones activas compatibles. Libera un hueco o añade estanterías en el mapa.'}</div>}
         </div>
         <div className="movement-rack-view">
-          {selectedRack ? <><div className="movement-rack-legend"><span><i className="product-bin-legend" /> Ubicación con este producto</span>{locationRole === 'to' && <span><i className="empty-bin-legend" /> Hueco vacío disponible</span>}</div><div className="movement-rack-canvas"><Suspense fallback={<div className="rack3d-loading">Cargando estantería 3D…</div>}><RackViewer3D key={`${selectedRack.id}-${productId}`} rack={selectedRack} locations={selectedRackLocations} selectedId={null} productId={productId} selectableLocationIds={selectableRackLocations.map((location) => location.id)} showAllLocations onSelectProduct={(_storedProducts, rackLocation) => {
+          {selectedRack ? <><div className="movement-rack-legend"><span><i className="product-bin-legend" /> Ubicación con este producto</span>{locationRole === 'to' && <span><i className={type === 'return' ? 'in-use-bin-legend' : 'empty-bin-legend'} /> {type === 'return' ? 'Ubicación original para devolver' : 'Hueco vacío disponible'}</span>}</div><div className="movement-rack-canvas"><Suspense fallback={<div className="rack3d-loading">Cargando estantería 3D…</div>}><RackViewer3D key={`${selectedRack.id}-${productId}`} rack={selectedRack} locations={selectedRackLocations} selectedId={null} productId={productId} selectableLocationIds={selectableRackLocations.map((location) => location.id)} showAllLocations onSelectProduct={(_storedProducts, rackLocation) => {
             const location = selectedRackLocations.find((item) => item.id === rackLocation.id);
             if (location) chooseLocation(location);
           }} /></Suspense></div><p className="movement-rack-hint">Haz clic en una caja resaltada para seleccionar la ubicación. Las cajas grises no se pueden elegir.</p></>

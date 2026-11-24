@@ -1282,6 +1282,12 @@ app.get('/api/locations', async (req, res, next) => {
              z.warehouse_id, w.name AS warehouse,
              z.name AS zone, a.id AS aisle_id, a.code AS aisle, r.id AS rack_id, r.code AS rack, rl.level_number,
              COALESCE(sum(sb.quantity), 0)::numeric AS quantity,
+             EXISTS (
+               SELECT 1
+               FROM in_use_loans loan
+               WHERE loan.original_bin_id = b.id
+                 AND loan.returned_quantity < loan.quantity
+             ) AS in_use,
              COALESCE(json_agg(json_build_object(
                'productId', p.id, 'sku', p.sku, 'name', p.name, 'quantity', sb.quantity, 'lot', l.lot_code
              )) FILTER (WHERE p.id IS NOT NULL), '[]') AS products,
@@ -1425,6 +1431,15 @@ async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: st
     ...slots.rows.filter((slot) => slot.merged_into_bin_id === anchor.id).map((slot) => slot.id)
   ]);
   const affectedBinIds = [...affectedIds];
+  const pendingLoan = await client.query(
+    `SELECT id FROM in_use_loans
+     WHERE original_bin_id = ANY($1::uuid[])
+       AND returned_quantity < quantity
+     LIMIT 1`,
+    [affectedBinIds]
+  );
+  if (pendingLoan.rowCount)
+    throw Object.assign(new Error('No se puede cambiar el tamaño de una ubicación reservada por un artículo En uso'), { status: 409 });
   const occupied = await client.query(
     'SELECT id FROM stock_balances WHERE bin_id = ANY($1::uuid[]) AND (quantity > 0 OR reserved_quantity > 0) FOR UPDATE',
     [affectedBinIds]
@@ -1971,6 +1986,7 @@ app.get('/api/in-use', async (_req, res, next) => {
   try {
     const result = await pool.query(`
       SELECT loan.id, loan.product_id, p.sku, p.name,
+             loan.original_bin_id,
              loan.quantity, loan.returned_quantity,
              (loan.quantity - loan.returned_quantity)::numeric AS remaining_quantity,
              l.lot_code, m.reference, m.created_at,
@@ -2053,6 +2069,9 @@ app.post('/api/movements', async (req, res, next) => {
     });
   }
   const input = parsed.data;
+  const user = res.locals.authUser as SessionUser;
+  if (user.role === 'employee' && input.type !== 'in_use' && input.type !== 'return')
+    return res.status(403).json({ error: 'Los empleados solo pueden registrar movimientos «En uso» o «Devolución»' });
   const warehouseId = res.locals.warehouseId as string;
   const destinationWarehouseId = input.type === 'transfer'
     ? input.destinationWarehouseId ?? warehouseId
@@ -2062,12 +2081,16 @@ app.post('/api/movements', async (req, res, next) => {
     await client.query('BEGIN');
     let productId: string;
     let destinationProductId: string;
-    let loan: { id: string; product_id: string; lot_id: string | null; quantity: string; returned_quantity: string } | undefined;
+    let loan: {
+      id: string; product_id: string; lot_id: string | null; original_bin_id: string;
+      quantity: string; returned_quantity: string
+    } | undefined;
     if (input.type === 'return') {
       const result = await client.query<{
-        id: string; product_id: string; lot_id: string | null; quantity: string; returned_quantity: string
+        id: string; product_id: string; lot_id: string | null; original_bin_id: string;
+        quantity: string; returned_quantity: string
       }>(`
-        SELECT id, product_id, lot_id, quantity, returned_quantity
+        SELECT id, product_id, lot_id, original_bin_id, quantity, returned_quantity
         FROM in_use_loans
         WHERE id = $1 AND warehouse_id = $2
         FOR UPDATE
@@ -2114,7 +2137,7 @@ app.post('/api/movements', async (req, res, next) => {
       JOIN racks r ON r.id = rl.rack_id JOIN aisles a ON a.id = r.aisle_id
       JOIN zones z ON z.id = a.zone_id
       WHERE b.id = ANY($1::uuid[])
-      ${input.binName || input.binWidthUnits !== undefined ? 'FOR UPDATE OF b' : 'FOR SHARE OF b'}
+      ${destinationBin || input.type === 'in_use' || input.binName || input.binWidthUnits !== undefined ? 'FOR UPDATE OF b' : 'FOR SHARE OF b'}
     `, [requestedBins]) : { rows: [] as { id: string; warehouse_id: string; status: string }[], rowCount: 0 };
     const binById = new Map(binWarehouses.rows.map((bin) => [bin.id, bin]));
     if (requestedBins.some((id) => binById.get(id)?.merged_into_bin_id))
@@ -2125,6 +2148,20 @@ app.post('/api/movements', async (req, res, next) => {
       throw Object.assign(new Error('La ubicación de destino no pertenece al almacén indicado'), { status: 400 });
     if (requestedBins.some((id) => binById.get(id)?.status !== 'active'))
       throw Object.assign(new Error('No se puede mover mercancía a una ubicación bloqueada'), { status: 409 });
+    if (destinationBin) {
+      if (input.type === 'return' && loan?.original_bin_id !== destinationBin)
+        throw Object.assign(new Error('La devolución debe volver a su ubicación original'), { status: 409 });
+      if (input.type !== 'return') {
+        const reservedBin = await client.query(
+          `SELECT id FROM in_use_loans
+           WHERE original_bin_id = $1 AND returned_quantity < quantity
+           LIMIT 1`,
+          [destinationBin]
+        );
+        if (reservedBin.rowCount)
+          throw Object.assign(new Error('Esta ubicación está reservada por un artículo En uso'), { status: 409 });
+      }
+    }
     if (input.binWidthUnits !== undefined && destinationBin)
       await setBinWidth(client, destinationBin, destinationWarehouseId, input.binWidthUnits);
     if (input.binName && destinationBin) {
@@ -2230,7 +2267,6 @@ app.post('/api/movements', async (req, res, next) => {
       }
     }
 
-    const user = res.locals.authUser as SessionUser;
     const movement = await client.query(
       `INSERT INTO movements (type, reference, created_by) VALUES ($1, $2, $3) RETURNING id, created_at`,
       [input.type, input.reference ?? null, user.id]
@@ -2429,7 +2465,7 @@ const receivePurchaseOrderSchema = z.object({
   })
 });
 
-app.post('/api/purchase-orders/:id/receive', async (req, res, next) => {
+app.post('/api/purchase-orders/:id/receive', requireAdmin, async (req, res, next) => {
   const parsedId = z.string().uuid().safeParse(req.params.id);
   const parsed = receivePurchaseOrderSchema.safeParse(req.body);
   if (!parsedId.success) return res.status(400).json({ error: 'Identificador de pedido no válido' });
@@ -2476,13 +2512,22 @@ app.post('/api/purchase-orders/:id/receive', async (req, res, next) => {
       JOIN racks r ON r.id = rl.rack_id
       JOIN aisles a ON a.id = r.aisle_id
       JOIN zones z ON z.id = a.zone_id
-      WHERE b.id = ANY($1::uuid[]) ${namedBins.size ? 'FOR UPDATE OF b' : 'FOR SHARE OF b'}
+      WHERE b.id = ANY($1::uuid[]) FOR UPDATE OF b
     `, [binIds]);
     const binsById = new Map(bins.rows.map((bin) => [bin.id, bin]));
     if (parsed.data.lines.some((line) => {
       const bin = binsById.get(line.binId);
       return !bin || bin.status !== 'active' || bin.merged_into_bin_id || bin.warehouse_id !== warehouseId;
     })) throw Object.assign(new Error('Selecciona ubicaciones activas del almacén actual'), { status: 400 });
+    const reservedBin = await client.query(
+      `SELECT id FROM in_use_loans
+       WHERE original_bin_id = ANY($1::uuid[])
+         AND returned_quantity < quantity
+       LIMIT 1`,
+      [binIds]
+    );
+    if (reservedBin.rowCount)
+      throw Object.assign(new Error('Una ubicación seleccionada está reservada por un artículo En uso'), { status: 409 });
 
     for (const [binId, binName] of namedBins) {
       const destinationStock = await client.query(
@@ -2711,7 +2756,7 @@ app.post('/api/sales-orders/:id/picking', async (req, res, next) => {
   }
 });
 
-app.post('/api/sales-orders/:id/fulfill', async (req, res, next) => {
+app.post('/api/sales-orders/:id/fulfill', requireAdmin, async (req, res, next) => {
   const parsedId = z.string().uuid().safeParse(req.params.id);
   if (!parsedId.success) return res.status(400).json({ error: 'Identificador de pedido no válido' });
   const warehouseId = res.locals.warehouseId as string;

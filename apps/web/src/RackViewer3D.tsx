@@ -12,10 +12,12 @@ type RackLocation = {
   depth_position: number;
   width_units: number;
   quantity: string | number;
+  in_use: boolean;
   products: { productId: string; sku: string; name: string; quantity: string | number; lot: string | null }[];
 };
 
 type Rack = {
+  name: string;
   code: string;
   map_width: string | number;
   map_height: string | number;
@@ -110,7 +112,7 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
         </group>
       ))}
 
-      {locations.filter((location) => showAllLocations || number(location.quantity) > 0 || (showFloorLocations && location.level_number === 0)).map((location, index) => {
+      {locations.filter((location) => showAllLocations || number(location.quantity) > 0 || location.in_use || (showFloorLocations && location.level_number === 0)).map((location, index) => {
         const isFloor = location.level_number === 0;
         const levelIndex = Math.max(0, Math.min(rack.level_count - 1, location.level_number - 1));
         const levelY = levelPositions[levelIndex] ?? 1;
@@ -127,7 +129,7 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
           : true;
         const isSelectable = selectableIds.has(location.id);
         const isHighlighted = Boolean(productId && hasProduct && isSelectable);
-        const isEmptyDestination = showAllLocations && number(location.quantity) <= 0 && isSelectable;
+        const isEmptyDestination = showAllLocations && number(location.quantity) <= 0 && !location.in_use && isSelectable;
         return (
           <group key={location.id}>
             <mesh
@@ -140,13 +142,13 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
             >
               <boxGeometry args={[Math.max(0.03, slotWidth), boxHeight, boxDepth]} />
               <meshStandardMaterial
-                color={isSelected ? '#f4a340' : isHighlighted ? (index % 2 ? '#51a879' : '#78c495') : isEmptyDestination ? '#77a9bd' : productId ? '#aeb8b2' : index % 2 ? '#c78d54' : '#d6a56c'}
+                color={isSelected ? '#f4a340' : isHighlighted ? (index % 2 ? '#51a879' : '#78c495') : location.in_use ? '#b88440' : isEmptyDestination ? '#77a9bd' : productId ? '#aeb8b2' : index % 2 ? '#c78d54' : '#d6a56c'}
                 roughness={0.68}
                 emissive={isSelected ? '#a84c08' : isHighlighted ? '#164d2c' : '#000000'}
                 emissiveIntensity={isSelected ? 0.25 : isHighlighted ? 0.12 : 0}
               />
             </mesh>
-            {showLocationLabels && number(location.quantity) > 0 && <Html position={[x, boxY + boxHeight / 2 + (isFloor ? 0.04 : beamHeight / 2 + 0.08), z]} center distanceFactor={8} zIndexRange={[10, 0]} style={{ pointerEvents: 'none', whiteSpace: 'nowrap' }}><span className="rack-bin-name">{location.display_name || location.code}</span></Html>}
+            {showLocationLabels && (number(location.quantity) > 0 || location.in_use) && <Html position={[x, boxY + boxHeight / 2 + (isFloor ? 0.04 : beamHeight / 2 + 0.08), z]} center distanceFactor={8} zIndexRange={[10, 0]} style={{ pointerEvents: 'none', whiteSpace: 'nowrap' }}><span className={`rack-bin-name ${location.in_use ? 'in-use' : ''}`}>{location.in_use ? 'EN USO · ' : ''}{location.display_name || location.code}</span></Html>}
           </group>
         );
       })}
@@ -171,7 +173,7 @@ export default function RackViewer3D(props: Props) {
   }, [props.rack.level_heights, props.rack.map_height, props.rack.map_width]);
 
   return (
-    <div className="rack-webgl-canvas" role="application" aria-label={`Visor 3D de la estantería ${props.rack.code}`}>
+    <div className="rack-webgl-canvas" role="application" aria-label={`Visor 3D de la estantería ${props.rack.name}`}>
       <Canvas key={props.rack.code} camera={camera} shadows>
         <ResizeCamera />
         <RackScene {...props} />

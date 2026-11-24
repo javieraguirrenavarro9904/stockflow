@@ -6,6 +6,7 @@ import {
 
 type MapRack = {
   id: string;
+  name: string;
   code: string;
   map_x: string | number;
   map_y: string | number;
@@ -14,7 +15,7 @@ type MapRack = {
   bin_count: number;
 };
 
-type MapLocation = { rack_id: string; quantity: string | number };
+type MapLocation = { rack_id: string; quantity: string | number; in_use: boolean };
 
 type Props = {
   width: number;
@@ -358,7 +359,7 @@ export default function WarehouseMap2D({
           const rackWidth = value(rack.map_width);
           const rackHeight = value(rack.map_height);
           const occupied = locations.filter((location) =>
-            location.rack_id === rack.id && value(location.quantity) > 0
+            location.rack_id === rack.id && (value(location.quantity) > 0 || location.in_use)
           ).length;
           const occupancy = Math.min(1, occupied / Math.max(1, rack.bin_count));
           const selected = rack.id === selectedRackId;
@@ -371,7 +372,7 @@ export default function WarehouseMap2D({
           return (
             <g
               key={rack.id}
-              aria-label={`Estantería ${rack.code}`}
+              aria-label={`Estantería ${rack.name}`}
               style={{ cursor: editing ? 'grab' : 'pointer' }}
             >
               <rect
@@ -387,11 +388,11 @@ export default function WarehouseMap2D({
                 x={centerX}
                 y={centerY - 35}
                 fill="#283b30"
-                fontSize={Math.max(80, Math.min(140, rackWidth / 16))}
+                fontSize={Math.max(20, Math.min(140, rackWidth * 0.72 / Math.max(1, rack.name.length * 0.56)))}
                 fontWeight="700"
                 textAnchor="middle"
                 dominantBaseline="middle"
-              >{rack.code}</text>
+              >{rack.name}</text>
               <rect x={centerX - barWidth / 2} y={centerY + 20} width={barWidth} height="50" fill="#d7e1da" />
               <rect x={centerX - barWidth / 2} y={centerY + 20} width={barWidth * occupancy} height="50" fill={accent} />
               <text
