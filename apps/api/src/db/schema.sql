@@ -230,6 +230,9 @@ CREATE INDEX IF NOT EXISTS idx_movement_lines_product ON movement_lines(product_
 CREATE OR REPLACE FUNCTION prevent_posted_movement_mutation()
 RETURNS TRIGGER LANGUAGE plpgsql AS $$
 BEGIN
+  IF TG_OP = 'DELETE' AND current_setting('stockflow.allow_rack_history_delete', true) = 'on' THEN
+    RETURN OLD;
+  END IF;
   RAISE EXCEPTION 'Posted movement history is immutable';
 END;
 $$;

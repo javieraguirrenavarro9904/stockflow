@@ -1038,16 +1038,74 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
         throw Object.assign(new Error('Uno o más pasillos no pertenecen a este almacén'), { status: 404 });
     }
     if (layout.deleteRackIds.length) {
-      const blocked = await client.query(`
-        SELECT DISTINCT r.code FROM racks r
-        JOIN rack_levels rl ON rl.rack_id = r.id
-        JOIN bins b ON b.rack_level_id = rl.id
-        WHERE r.id = ANY($1::uuid[])
-          AND (EXISTS (SELECT 1 FROM stock_balances sb WHERE sb.bin_id = b.id)
-            OR EXISTS (SELECT 1 FROM movement_lines ml WHERE ml.from_bin_id = b.id OR ml.to_bin_id = b.id))
+      const bins = await client.query<{ id: string }>(`
+        SELECT b.id
+        FROM bins b
+        JOIN rack_levels rl ON rl.id = b.rack_level_id
+        WHERE rl.rack_id = ANY($1::uuid[])
+        ORDER BY b.id
+        FOR UPDATE OF b
       `, [layout.deleteRackIds]);
-      if (blocked.rowCount)
-        throw Object.assign(new Error(`No se pueden eliminar estanterías con stock o historial: ${blocked.rows.map((row) => row.code).join(', ')}`), { status: 409 });
+      const binIds = bins.rows.map((bin) => bin.id);
+      if (binIds.length) {
+        await client.query(
+          'SELECT id FROM stock_balances WHERE bin_id = ANY($1::uuid[]) ORDER BY id FOR UPDATE',
+          [binIds]
+        );
+        const occupied = await client.query(`
+          SELECT DISTINCT r.code
+          FROM racks r
+          JOIN rack_levels rl ON rl.rack_id = r.id
+          JOIN bins b ON b.rack_level_id = rl.id
+          JOIN stock_balances sb ON sb.bin_id = b.id
+          WHERE r.id = ANY($1::uuid[]) AND (sb.quantity > 0 OR sb.reserved_quantity > 0)
+        `, [layout.deleteRackIds]);
+        if (occupied.rowCount)
+          throw Object.assign(new Error(`Vacía el stock y las reservas antes de eliminar estas estanterías: ${occupied.rows.map((row) => row.code).join(', ')}`), { status: 409 });
+
+        const pendingLoans = await client.query(`
+          SELECT DISTINCT r.code
+          FROM racks r
+          JOIN rack_levels rl ON rl.rack_id = r.id
+          JOIN bins b ON b.rack_level_id = rl.id
+          JOIN in_use_loans loan ON loan.original_bin_id = b.id
+          WHERE r.id = ANY($1::uuid[]) AND loan.returned_quantity < loan.quantity
+        `, [layout.deleteRackIds]);
+        if (pendingLoans.rowCount)
+          throw Object.assign(new Error(`Devuelve los artículos En uso antes de eliminar estas estanterías: ${pendingLoans.rows.map((row) => row.code).join(', ')}`), { status: 409 });
+
+        const affectedMovements = await client.query<{ movement_id: string }>(`
+          SELECT DISTINCT movement_id FROM movement_lines
+          WHERE from_bin_id = ANY($1::uuid[]) OR to_bin_id = ANY($1::uuid[])
+        `, [binIds]);
+        await client.query(`
+          DELETE FROM in_use_loans
+          WHERE original_bin_id = ANY($1::uuid[])
+             OR movement_line_id IN (
+               SELECT id FROM movement_lines
+               WHERE from_bin_id = ANY($1::uuid[]) OR to_bin_id = ANY($1::uuid[])
+             )
+        `, [binIds]);
+        await client.query(`
+          DELETE FROM sales_order_allocations soa
+          USING stock_balances sb
+          WHERE soa.stock_balance_id = sb.id AND sb.bin_id = ANY($1::uuid[])
+        `, [binIds]);
+        await client.query('DELETE FROM stock_balances WHERE bin_id = ANY($1::uuid[])', [binIds]);
+        await client.query("SELECT set_config('stockflow.allow_rack_history_delete', 'on', true)");
+        await client.query(`
+          DELETE FROM movement_lines
+          WHERE from_bin_id = ANY($1::uuid[]) OR to_bin_id = ANY($1::uuid[])
+        `, [binIds]);
+        const movementIds = affectedMovements.rows.map((movement) => movement.movement_id);
+        if (movementIds.length) {
+          await client.query(`
+            DELETE FROM movements m
+            WHERE m.id = ANY($1::uuid[])
+              AND NOT EXISTS (SELECT 1 FROM movement_lines ml WHERE ml.movement_id = m.id)
+          `, [movementIds]);
+        }
+      }
       await client.query('DELETE FROM racks WHERE id = ANY($1::uuid[])', [layout.deleteRackIds]);
     }
     await client.query(

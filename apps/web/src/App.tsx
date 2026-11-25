@@ -2013,7 +2013,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
   };
 
   const removeRack = (rack: Rack) => {
-    if (!window.confirm(`¿Eliminar la estantería ${rack.code}? Los cambios se aplicarán al guardar el plano.`)) return;
+    if (!window.confirm(`¿Eliminar permanentemente la estantería ${rack.code}? Al guardar se borrarán también sus movimientos históricos y referencias de ubicación en pedidos. No se puede deshacer. La estantería debe estar sin stock, reservas ni artículos En uso pendientes.`)) return;
     setRackDraft((current) => current.filter((item) => item.id !== rack.id));
     setSelectedRackId(null);
   };
