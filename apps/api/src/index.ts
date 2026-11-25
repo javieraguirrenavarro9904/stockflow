@@ -1340,7 +1340,7 @@ app.get('/api/locations', async (req, res, next) => {
     const warehouseId = requestedWarehouse.success ? requestedWarehouse.data : res.locals.warehouseId as string;
     const result = await pool.query(`
       SELECT b.id, b.code, b.barcode, b.capacity, b.display_name, b.map_x, b.map_y, b.map_width, b.map_height,
-             b.width_units, b.depth_position, substring(b.code from '-([0-9]+)$')::int AS slot_position, b.status,
+             b.width_units, b.depth_position, substring(b.code from '-H([0-9]+)$')::int AS slot_position, b.status,
              z.warehouse_id, w.name AS warehouse,
              z.name AS zone, a.id AS aisle_id, a.code AS aisle, r.id AS rack_id, r.code AS rack, rl.level_number,
              COALESCE(sum(sb.quantity), 0)::numeric AS quantity,
@@ -1453,7 +1453,7 @@ async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: st
              (SELECT count(*)::int FROM bins level_bins
               WHERE level_bins.rack_level_id = b.rack_level_id
                 AND level_bins.depth_position = b.depth_position) AS slots_per_level,
-             b.depth_position, substring(b.code from '-([0-9]+)$')::int AS slot_position
+             b.depth_position, substring(b.code from '-H([0-9]+)$')::int AS slot_position
       FROM bins b
       JOIN rack_levels rl ON rl.id = b.rack_level_id
       JOIN racks r ON r.id = rl.rack_id
@@ -1475,7 +1475,7 @@ async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: st
 
   const slots = await client.query(`
       SELECT b.id, b.width_units, b.depth_position, b.merged_into_bin_id, b.status,
-             substring(b.code from '-([0-9]+)$')::int AS slot_position
+             substring(b.code from '-H([0-9]+)$')::int AS slot_position
       FROM bins b WHERE b.rack_level_id = $1 AND b.depth_position = $2 ORDER BY b.code FOR UPDATE
     `, [anchor.rack_level_id, anchor.depth_position]);
   const targetPositions = Array.from({ length: widthUnits }, (_value, index) => anchor.slot_position + index);
