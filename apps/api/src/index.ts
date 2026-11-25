@@ -2315,6 +2315,142 @@ app.post('/api/movements', async (req, res, next) => {
   }
 });
 
+const bulkReceiptSchema = z.object({
+  reference: z.string().trim().max(120).optional(),
+  lines: z.array(z.object({
+    sku: z.string().trim().min(2).max(64),
+    name: z.string().trim().min(2).max(160),
+    binId: z.string().uuid(),
+    quantity: z.coerce.number().positive().max(100000000),
+    lotCode: z.string().trim().min(1).max(100).optional(),
+    expiresAt: z.string().refine(
+      (value) => !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value,
+      'Fecha de caducidad no válida'
+    ).optional()
+  }).superRefine((line, ctx) => {
+    if (line.expiresAt && !line.lotCode)
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['lotCode'], message: 'Indica el código de lote para guardar su caducidad' });
+  })).min(1).max(500)
+});
+
+app.post('/api/movements/bulk-receipt', requireAdmin, async (req, res, next) => {
+  const parsed = bulkReceiptSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Importación no válida', details: parsed.error.flatten() });
+  const { lines, reference } = parsed.data;
+  const warehouseId = res.locals.warehouseId as string;
+  const user = res.locals.authUser as SessionUser;
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    const skus = [...new Set(lines.map((line) => line.sku))];
+    const products = await client.query<{ id: string; sku: string; active: boolean }>(`
+      SELECT id, sku, active FROM products
+      WHERE warehouse_id = $1 AND sku = ANY($2::text[])
+      ORDER BY id FOR UPDATE
+    `, [warehouseId, skus]);
+    const productIdBySku = new globalThis.Map<string, { id: string; active: boolean }>(
+      products.rows.map((product) => [product.sku, { id: product.id, active: product.active }])
+    );
+    if (products.rows.some((product) => !product.active))
+      throw Object.assign(new Error('Un SKU del archivo pertenece a un producto archivado y no se puede volver a crear'), { status: 409 });
+
+    const namesByNewSku = new globalThis.Map<string, string>();
+    for (const line of lines) {
+      if (productIdBySku.has(line.sku)) continue;
+      const previousName = namesByNewSku.get(line.sku);
+      if (previousName !== undefined && previousName !== line.name)
+        throw Object.assign(new Error(`El SKU ${line.sku} aparece con nombres distintos en el archivo`), { status: 400 });
+      namesByNewSku.set(line.sku, line.name);
+    }
+    let createdProductCount = 0;
+    for (const [sku, name] of namesByNewSku) {
+      const inserted = await client.query<{ id: string }>(`
+        INSERT INTO products (warehouse_id, sku, name)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (warehouse_id, sku) DO NOTHING
+        RETURNING id
+      `, [warehouseId, sku, name]);
+      let productId = inserted.rows[0]?.id;
+      if (productId) {
+        createdProductCount += 1;
+      } else {
+        const existing = await client.query<{ id: string; active: boolean }>(`
+          SELECT id, active FROM products
+          WHERE warehouse_id = $1 AND sku = $2
+          FOR UPDATE
+        `, [warehouseId, sku]);
+        const existingProduct = existing.rows[0];
+        if (!existingProduct || !existingProduct.active)
+          throw Object.assign(new Error(`El SKU ${sku} ya está ocupado por un producto archivado`), { status: 409 });
+        productId = existingProduct.id;
+      }
+      productIdBySku.set(sku, { id: productId, active: true });
+    }
+
+    const binIds = [...new Set(lines.map((line) => line.binId))];
+    const bins = await client.query(`
+      SELECT b.id, z.warehouse_id, b.status, b.merged_into_bin_id
+      FROM bins b
+      JOIN rack_levels rl ON rl.id = b.rack_level_id
+      JOIN racks r ON r.id = rl.rack_id
+      JOIN aisles a ON a.id = r.aisle_id
+      JOIN zones z ON z.id = a.zone_id
+      WHERE b.id = ANY($1::uuid[])
+      ORDER BY b.id FOR UPDATE OF b
+    `, [binIds]);
+    if (bins.rowCount !== binIds.length || bins.rows.some((bin) => bin.warehouse_id !== warehouseId))
+      throw Object.assign(new Error('Hay ubicaciones que no pertenecen a este almacén'), { status: 400 });
+    if (bins.rows.some((bin) => bin.status !== 'active'))
+      throw Object.assign(new Error('No se puede recibir mercancía en ubicaciones bloqueadas'), { status: 409 });
+    if (bins.rows.some((bin) => bin.merged_into_bin_id))
+      throw Object.assign(new Error('No se puede recibir mercancía en huecos que forman parte de una caja grande'), { status: 409 });
+    const reservedBins = await client.query(`
+      SELECT DISTINCT original_bin_id
+      FROM in_use_loans
+      WHERE original_bin_id = ANY($1::uuid[]) AND returned_quantity < quantity
+    `, [binIds]);
+    if (reservedBins.rowCount)
+      throw Object.assign(new Error('Hay ubicaciones reservadas por artículos En uso'), { status: 409 });
+
+    const movement = await client.query(
+      `INSERT INTO movements (type, reference, created_by) VALUES ('receipt', $1, $2) RETURNING id, created_at`,
+      [reference ?? null, user.id]
+    );
+    for (const line of lines) {
+      let lotId: string | null = null;
+      const productId = productIdBySku.get(line.sku)?.id;
+      if (!productId) throw new Error(`No se pudo resolver el SKU ${line.sku}`);
+      if (line.lotCode) {
+        const lot = await client.query(`
+          INSERT INTO lots (product_id, lot_code, expires_at)
+          VALUES ($1, $2, $3::date)
+          ON CONFLICT (product_id, lot_code)
+          DO UPDATE SET expires_at = COALESCE(EXCLUDED.expires_at, lots.expires_at)
+          RETURNING id
+        `, [productId, line.lotCode, line.expiresAt ?? null]);
+        lotId = lot.rows[0].id;
+      }
+      await client.query(`
+        INSERT INTO stock_balances (product_id, lot_id, bin_id, quantity)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (product_id, lot_id, bin_id)
+        DO UPDATE SET quantity = stock_balances.quantity + EXCLUDED.quantity, updated_at = now()
+      `, [productId, lotId, line.binId, line.quantity]);
+      await client.query(`
+        INSERT INTO movement_lines (movement_id, product_id, lot_id, quantity, to_bin_id)
+        VALUES ($1, $2, $3, $4, $5)
+      `, [movement.rows[0].id, productId, lotId, line.quantity, line.binId]);
+    }
+    await client.query('COMMIT');
+    res.status(201).json({ id: movement.rows[0].id, createdAt: movement.rows[0].created_at, lineCount: lines.length, createdProductCount });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    next(error);
+  } finally {
+    client.release();
+  }
+});
+
 app.get('/api/replenishment', async (_req, res, next) => {
   try {
     const warehouseId = res.locals.warehouseId as string;

@@ -35,7 +35,6 @@ type Props = {
   productId?: string;
   selectableLocationIds?: string[];
   showAllLocations?: boolean;
-  showFloorLocations?: boolean;
   showLocationLabels?: boolean;
 };
 
@@ -53,7 +52,7 @@ function ResizeCamera() {
   return null;
 }
 
-function RackScene({ rack, locations, selectedId, onSelectProduct, productId, selectableLocationIds, showAllLocations, showFloorLocations, showLocationLabels = true }: Props) {
+function RackScene({ rack, locations, selectedId, onSelectProduct, productId, selectableLocationIds, showAllLocations, showLocationLabels = true }: Props) {
   const width = Math.max(1.6, number(rack.map_width) / 100);
   const depth = Math.max(1, number(rack.map_height) / 100);
   const uprightWidth = Math.min(0.12, Math.max(0.05, width * 0.025));
@@ -112,7 +111,7 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
         </group>
       ))}
 
-      {locations.filter((location) => showAllLocations || number(location.quantity) > 0 || location.in_use || (showFloorLocations && location.level_number === 0)).map((location, index) => {
+      {locations.filter((location) => showAllLocations || number(location.quantity) > 0 || location.in_use).map((location, index) => {
         const isFloor = location.level_number === 0;
         const levelIndex = Math.max(0, Math.min(rack.level_count - 1, location.level_number - 1));
         const levelY = levelPositions[levelIndex] ?? 1;

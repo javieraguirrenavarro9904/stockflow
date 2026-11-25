@@ -145,6 +145,44 @@ function downloadCsv(filename: string, rows: (string | number | null | undefined
   URL.revokeObjectURL(url);
 }
 
+function parseCsv(text: string) {
+  const firstLine = text.replace(/^\uFEFF/, '').split(/\r?\n/, 1)[0] ?? '';
+  const delimiter = (firstLine.match(/;/g) ?? []).length >= (firstLine.match(/,/g) ?? []).length ? ';' : ',';
+  const rows: string[][] = [];
+  let row: string[] = [];
+  let field = '';
+  let quoted = false;
+  const source = text.replace(/^\uFEFF/, '');
+
+  for (let index = 0; index < source.length; index += 1) {
+    const character = source[index];
+    if (character === '"' && quoted && source[index + 1] === '"') {
+      field += '"';
+      index += 1;
+    } else if (character === '"') {
+      quoted = !quoted;
+    } else if (character === delimiter && !quoted) {
+      row.push(field);
+      field = '';
+    } else if ((character === '\n' || character === '\r') && !quoted) {
+      if (character === '\r' && source[index + 1] === '\n') index += 1;
+      row.push(field);
+      if (row.some((cell) => cell.trim())) rows.push(row);
+      row = [];
+      field = '';
+    } else {
+      field += character;
+    }
+  }
+  row.push(field);
+  if (row.some((cell) => cell.trim())) rows.push(row);
+  return rows;
+}
+
+function normalizeCsvHeader(value: string) {
+  return value.trim().toLocaleLowerCase('es').normalize('NFD').replace(/[\u0300-\u036f]/g, '');
+}
+
 export default function App() {
   const [user, setUser] = useState<AuthUser | null>(null);
   const [checkingSession, setCheckingSession] = useState(true);
@@ -228,7 +266,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
   const [movementSaving, setMovementSaving] = useState(false);
   const [search, setSearch] = useState('');
   const [selectedLocation, setSelectedLocation] = useState<Location | null>(null);
-  const [modal, setModal] = useState<'product' | 'editProduct' | 'movement' | 'employee' | 'warehouse' | null>(null);
+  const [modal, setModal] = useState<'product' | 'editProduct' | 'movement' | 'bulkReceipt' | 'employee' | 'warehouse' | null>(null);
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
   const [movementDefaults, setMovementDefaults] = useState<{ type: string; fromBinId?: string } | null>(null);
   const [toast, setToast] = useState('');
@@ -533,6 +571,25 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
     }
   };
 
+  const saveBulkReceipt = async (reference: string, lines: { sku: string; name: string; binId: string; quantity: number; lotCode?: string; expiresAt?: string }[]) => {
+    if (movementSaving) return;
+    setMovementSaving(true);
+    setMovementError('');
+    try {
+      const result = await request<{ createdProductCount: number }>('/movements/bulk-receipt', {
+        method: 'POST',
+        body: JSON.stringify({ reference: reference.trim() || undefined, lines })
+      });
+      setModal(null);
+      await refresh();
+      notify(`${lines.length} líneas importadas · ${result.createdProductCount} productos nuevos`);
+    } catch (reason) {
+      setMovementError(reason instanceof Error ? reason.message : 'No se pudo importar el archivo');
+    } finally {
+      setMovementSaving(false);
+    }
+  };
+
   const saveExpectedContent = async (locationId: string, expected: { productId: string; quantity: number }[]): Promise<boolean> => {
     try {
       await request(`/locations/${locationId}/expected-content`, {
@@ -775,7 +832,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
           {error && <div className="error-banner"><CircleHelp size={17} /><span>{error}. Comprueba que la API y PostgreSQL estén en ejecución.</span><button onClick={() => void refresh()}>Reintentar</button></div>}
           {loading && <div className="loading-line"><span /> Conectando con el almacén…</div>}
           {page === 'overview' && <OverviewPage overview={overview} movements={movements} onNavigate={navigateToPage} />}
-          {page === 'inventory' && <InventoryPage products={visibleProducts} locations={locations} search={search} isAdmin={isAdmin} onAdd={() => { setEditingProduct(null); setModal('product'); }} onEdit={(product) => { setEditingProduct(product); setModal('editProduct'); }} onMovement={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onDelete={async (id) => {
+          {page === 'inventory' && <InventoryPage products={visibleProducts} locations={locations} search={search} isAdmin={isAdmin} onAdd={() => { setEditingProduct(null); setModal('product'); }} onBulkReceipt={() => { setMovementError(''); setModal('bulkReceipt'); }} onEdit={(product) => { setEditingProduct(product); setModal('editProduct'); }} onMovement={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onDelete={async (id) => {
             if (!window.confirm('¿Archivar este producto? No aparecerá en el catálogo activo.')) return;
             try { await request(`/products/${id}`, { method: 'DELETE' }); await refresh(); notify('Producto archivado'); }
             catch (reason) { setError(reason instanceof Error ? reason.message : 'No se pudo archivar'); }
@@ -788,13 +845,15 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
           {page === 'settings' && <SettingsPage user={user} users={users} categories={categories} suppliers={suppliers} employeeMovementAlerts={employeeMovementAlerts} unreadEmployeeMovementAlerts={unreadEmployeeMovementAlerts} isAdmin={isAdmin} onAddUser={() => setModal('employee')} onToggleUser={(entry) => void toggleEmployee(entry)} onChangePassword={changePassword} onCreateCatalogEntry={createCatalogEntry} onDeleteCatalogEntry={deleteCatalogEntry} onMarkEmployeeAlertsRead={() => void markEmployeeAlertsRead()} />}
         </div>
       </main>
-      {modal && <Modal wide={modal === 'movement'} error={modal === 'movement' ? movementError : ''} title={modal === 'product' ? 'Añadir producto' : modal === 'editProduct' ? 'Editar producto' : modal === 'employee' ? 'Crear cuenta de empleado' : modal === 'warehouse' ? 'Añadir almacén' : 'Registrar movimiento'} onClose={() => { setModal(null); setEditingProduct(null); setMovementDefaults(null); setMovementError(''); }}>
+      {modal && <Modal wide={modal === 'movement' || modal === 'bulkReceipt'} error={modal === 'movement' || modal === 'bulkReceipt' ? movementError : ''} title={modal === 'product' ? 'Añadir producto' : modal === 'editProduct' ? 'Editar producto' : modal === 'employee' ? 'Crear cuenta de empleado' : modal === 'warehouse' ? 'Añadir almacén' : modal === 'bulkReceipt' ? 'Entrada masiva desde CSV' : 'Registrar movimiento'} onClose={() => { setModal(null); setEditingProduct(null); setMovementDefaults(null); setMovementError(''); }}>
         {(modal === 'product' || modal === 'editProduct')
           ? <ProductForm initial={editingProduct} categories={categories} suppliers={suppliers} onSubmit={(event) => void saveProduct(event, editingProduct ?? undefined)} onCancel={() => { setModal(null); setEditingProduct(null); }} />
           : modal === 'employee'
             ? <EmployeeForm onSubmit={saveEmployee} onCancel={() => setModal(null)} />
         : modal === 'warehouse'
           ? <WarehouseForm onSubmit={saveWarehouse} onCancel={() => setModal(null)} />
+        : modal === 'bulkReceipt'
+          ? <BulkReceiptForm products={products} locations={locations} saving={movementSaving} onSubmit={(reference, lines) => void saveBulkReceipt(reference, lines)} onCancel={() => setModal(null)} />
           : <MovementForm key={`${movementDefaults?.type ?? 'receipt'}-${movementDefaults?.fromBinId ?? 'new'}`} products={products} locations={locations} racks={racks} warehouses={warehouses} inUseLoans={inUseLoans} currentWarehouseId={selectedWarehouseId ?? ''} isAdmin={isAdmin} initialType={movementDefaults?.type} initialFromBinId={movementDefaults?.fromBinId} saving={movementSaving} onSubmit={saveMovement} onCancel={() => { setModal(null); setMovementDefaults(null); setMovementError(''); }} />}
       </Modal>}
       {toast && <div className="toast"><Check size={17} />{toast}</div>}
@@ -1049,11 +1108,11 @@ function MovementTable({ movements }: { movements: Movement[] }) {
   </tbody></table></div>;
 }
 
-function InventoryPage({ products, locations, search, isAdmin, onAdd, onEdit, onMovement, onDelete }: { products: Product[]; locations: Location[]; search: string; isAdmin: boolean; onAdd: () => void; onEdit: (product: Product) => void; onMovement: () => void; onDelete: (id: string) => void }) {
+function InventoryPage({ products, locations, search, isAdmin, onAdd, onBulkReceipt, onEdit, onMovement, onDelete }: { products: Product[]; locations: Location[]; search: string; isAdmin: boolean; onAdd: () => void; onBulkReceipt: () => void; onEdit: (product: Product) => void; onMovement: () => void; onDelete: (id: string) => void }) {
   const [filter, setFilter] = useState('Todos');
   const filtered = products.filter((p) => filter === 'Todos' || (filter === 'Stock bajo' ? number(p.stock) - number(p.reserved) <= number(p.min_stock) : filter === 'En stock' ? number(p.stock) - number(p.reserved) > number(p.min_stock) : true));
   return <>
-    <PageIntro eyebrow="CONTROL DE EXISTENCIAS" title="Inventario" description="Consulta el catálogo propio de este almacén, sus existencias y alertas de reposición." actions={<><button className="button button-secondary" onClick={onMovement}><ArrowLeftRight size={16} /> Movimiento</button>{isAdmin && <button className="button button-primary" onClick={onAdd}><Plus size={17} /> Añadir producto</button>}</>} />
+    <PageIntro eyebrow="CONTROL DE EXISTENCIAS" title="Inventario" description="Consulta el catálogo propio de este almacén, sus existencias y alertas de reposición." actions={<><button className="button button-secondary" onClick={onMovement}><ArrowLeftRight size={16} /> Movimiento</button>{isAdmin && <><button className="button button-secondary" onClick={onBulkReceipt}><Upload size={15} /> Carga masiva CSV</button><button className="button button-primary" onClick={onAdd}><Plus size={17} /> Añadir producto</button></>}</>} />
     <section className="panel inventory-panel">
       <div className="inventory-toolbar"><div className="filter-tabs">{['Todos', 'En stock', 'Stock bajo'].map((f) => <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}>{f}{f === 'Stock bajo' && <span className="filter-count">{products.filter((p) => number(p.stock) - number(p.reserved) <= number(p.min_stock)).length}</span>}</button>)}</div><div className="inventory-tools"><span>{search ? `${filtered.length} resultados` : `${filtered.length} productos`}</span><button className="icon-button" aria-label="Descargar inventario" title="Descargar CSV" onClick={() => downloadCsv('inventario.csv', [['SKU', 'Producto', 'Categoría', 'Proveedor', 'Stock', 'Reservado', 'Mínimo', 'Ubicación'], ...filtered.map((p) => [p.sku, p.name, p.category, p.supplier, p.stock, p.reserved, p.min_stock, locations.find((bin) => bin.products.some((stock) => stock.productId === p.id))?.code ?? ''])])}><Download size={17} /></button></div></div>
       <div className="table-wrap inventory-table"><table><thead><tr><th>PRODUCTO</th><th>CATEGORÍA</th><th>SKU / CÓDIGO</th><th>STOCK DISPONIBLE</th><th>UBICACIÓN</th><th>ESTADO</th><th /></tr></thead><tbody>
@@ -1271,7 +1330,7 @@ function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin,
     <section className="rack3d-layout">
       <div className="panel rack3d-panel">
         <div className="rack3d-heading"><div><span className="eyebrow">ESTANTERÍA INDUSTRIAL · VISTA 3D</span><h2>{rack.name}</h2><p>Selecciona un paquete para consultar el producto y su ubicación.</p></div></div>
-        <div className="rack3d-stage"><Suspense fallback={<div className="rack3d-loading">Cargando visor 3D…</div>}><RackViewer3D rack={rack} locations={locations} selectedId={selected?.id ?? null} showFloorLocations={!qrLabelsOpen} showLocationLabels={!qrLabelsOpen} onSelectProduct={(_products, location) => {
+        <div className="rack3d-stage"><Suspense fallback={<div className="rack3d-loading">Cargando visor 3D…</div>}><RackViewer3D rack={rack} locations={locations} selectedId={selected?.id ?? null} showLocationLabels={!qrLabelsOpen} onSelectProduct={(_products, location) => {
           onSelect(locations.find((item) => item.id === location.id) ?? null);
         }} /></Suspense></div>
       </div>
@@ -2188,6 +2247,126 @@ function AssistantPage() {
 
 function Modal({ title, onClose, children, wide = false, error = '' }: { title: string; onClose: () => void; children: ReactNode; wide?: boolean; error?: string }) {
   return <div className="modal-backdrop" onMouseDown={(e) => { if (e.target === e.currentTarget) onClose(); }}><section className={`modal ${wide ? 'wide' : ''}`}><div className="modal-heading"><div><span className="eyebrow">GESTIÓN DE ALMACÉN</span><h2>{title}</h2></div><button className="icon-button" onClick={onClose} aria-label="Cerrar"><X size={18} /></button></div>{error && <p className="form-error movement-submit-error" role="alert">{error}</p>}{children}</section></div>;
+}
+
+function BulkReceiptForm({ products, locations, saving, onSubmit, onCancel }: {
+  products: Product[];
+  locations: Location[];
+  saving: boolean;
+  onSubmit: (reference: string, lines: { sku: string; name: string; binId: string; quantity: number; lotCode?: string; expiresAt?: string }[]) => void;
+  onCancel: () => void;
+}) {
+  type ImportRow = {
+    lineNumber: number; sku: string; productName: string; isNew: boolean; locationCode: string;
+    quantity: number; lotCode: string; expiresAt: string; binId: string; error: string;
+  };
+  const [rows, setRows] = useState<ImportRow[]>([]);
+  const [fileName, setFileName] = useState('');
+  const [fileError, setFileError] = useState('');
+  const [reference, setReference] = useState('');
+  const validRows = rows.filter((row) => !row.error);
+  const invalidRows = rows.filter((row) => row.error);
+
+  const handleFile = async (file?: File) => {
+    setRows([]);
+    setFileError('');
+    setFileName(file?.name ?? '');
+    if (!file) return;
+    try {
+      const csvRows = parseCsv(await file.text());
+      if (csvRows.length < 2) throw new Error('El CSV debe incluir una cabecera y al menos una línea.');
+      const headers = csvRows[0].map(normalizeCsvHeader);
+      const indexOf = (...names: string[]) => headers.findIndex((header) => names.includes(header));
+      const skuIndex = indexOf('sku');
+      const nameIndex = indexOf('nombre', 'producto', 'nombre producto');
+      const locationIndex = indexOf('ubicacion', 'location', 'codigo ubicacion', 'codigo de ubicacion');
+      const quantityIndex = indexOf('cantidad', 'quantity');
+      const lotIndex = indexOf('lote', 'lot');
+      const expiryIndex = indexOf('caducidad', 'expiresat', 'expiry');
+      if (skuIndex < 0 || locationIndex < 0 || quantityIndex < 0)
+        throw new Error('Faltan columnas obligatorias: SKU, Ubicación y Cantidad.');
+      const dataRows = csvRows.slice(1);
+      if (dataRows.length > 500) throw new Error('El archivo supera el límite de 500 líneas por importación.');
+
+      const productBySku = new globalThis.Map(products.filter((product) => product.active !== false).map((product) => [product.sku.trim().toLocaleUpperCase('es'), product]));
+      const locationByCode = new globalThis.Map(locations.map((location) => [location.code.trim().toLocaleUpperCase('es'), location]));
+      const newProductsBySku = new globalThis.Map<string, { sku: string; name: string }>();
+      setRows(dataRows.map((cells, index) => {
+        const sku = (cells[skuIndex] ?? '').trim();
+        const suppliedName = nameIndex >= 0 ? (cells[nameIndex] ?? '').trim() : '';
+        const locationCode = (cells[locationIndex] ?? '').trim();
+        const quantityText = (cells[quantityIndex] ?? '').trim();
+        const quantity = Number(quantityText.replace(',', '.'));
+        const lotCode = lotIndex >= 0 ? (cells[lotIndex] ?? '').trim() : '';
+        const expiresAt = expiryIndex >= 0 ? (cells[expiryIndex] ?? '').trim() : '';
+        const product = productBySku.get(sku.toLocaleUpperCase('es'));
+        let resolvedSku = product?.sku ?? sku;
+        let productName = product?.name ?? suppliedName;
+        const isNew = !product && Boolean(sku && suppliedName);
+        const location = locationByCode.get(locationCode.toLocaleUpperCase('es'));
+        const errors = [];
+        if (!sku) errors.push('Falta el SKU');
+        else if (!product && !suppliedName) errors.push(`El SKU nuevo ${sku} necesita un nombre de producto`);
+        else if (!product && suppliedName.length < 2) errors.push('El nombre del producto debe tener al menos 2 caracteres');
+        if (isNew) {
+          const skuKey = sku.toLocaleUpperCase('es');
+          const previous = newProductsBySku.get(skuKey);
+          if (previous && previous.name !== suppliedName) errors.push(`El SKU ${sku} tiene nombres distintos en el archivo`);
+          else if (previous) {
+            resolvedSku = previous.sku;
+            productName = previous.name;
+          } else newProductsBySku.set(skuKey, { sku, name: suppliedName });
+        }
+        if (!locationCode) errors.push('Falta la ubicación');
+        else if (!location) errors.push(`No existe la ubicación ${locationCode}`);
+        else if (location.status !== 'active') errors.push('La ubicación está bloqueada');
+        else if (location.in_use) errors.push('La ubicación está reservada En uso');
+        if (!quantityText || !Number.isFinite(quantity) || quantity <= 0) errors.push('La cantidad debe ser mayor que cero');
+        if (expiresAt && !lotCode) errors.push('La caducidad requiere un lote');
+        if (expiresAt && (Number.isNaN(Date.parse(expiresAt)) || new Date(expiresAt).toISOString().slice(0, 10) !== expiresAt))
+          errors.push('La fecha debe tener formato AAAA-MM-DD');
+        return {
+          lineNumber: index + 2, sku: resolvedSku, productName, isNew, locationCode,
+          quantity, lotCode, expiresAt, binId: location?.id ?? '',
+          error: errors.join(' · ')
+        };
+      }));
+    } catch (reason) {
+      setFileError(reason instanceof Error ? reason.message : 'No se pudo leer el archivo CSV');
+    }
+  };
+
+  const submit = (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!rows.length || rows.some((row) => row.error)) return;
+    onSubmit(reference, validRows.map(({ sku, productName, binId, quantity, lotCode, expiresAt }) => ({
+      sku, name: productName, binId, quantity, lotCode: lotCode || undefined, expiresAt: expiresAt || undefined
+    })));
+  };
+
+  return <form className="form-grid bulk-receipt-form" onSubmit={submit}>
+    <div className="bulk-import-instructions">
+      <strong>Prepara productos y ubicaciones en una hoja de cálculo y carga todo de una vez.</strong>
+      <span>Columnas principales: SKU, Ubicación y Cantidad. Añade Nombre cuando quieras crear un SKU nuevo; los productos existentes conservan el nombre del catálogo. Lote y Caducidad (AAAA-MM-DD) son opcionales. Las altas nuevas usan unidad «ud» y stock mínimo 0. Usa el código exacto de ubicación y separa con punto y coma o coma.</span>
+      <button type="button" className="text-button" onClick={() => downloadCsv('plantilla-entrada-masiva.csv', [['SKU', 'Nombre', 'Ubicación', 'Cantidad', 'Lote', 'Caducidad']])}><Download size={14} /> Descargar plantilla CSV</button>
+    </div>
+    <label>Archivo CSV<input type="file" accept=".csv,text/csv" onChange={(event) => void handleFile(event.currentTarget.files?.[0])} /></label>
+    {fileName && <small className="field-help">Archivo: {fileName}</small>}
+    {fileError && <p className="form-error" role="alert">{fileError}</p>}
+    {rows.length > 0 && <div className="bulk-import-preview">
+      <div className="bulk-import-summary"><strong>{validRows.length} de {rows.length} líneas válidas</strong><span>La importación solo se hará si todas las líneas son válidas.</span></div>
+      <div className="table-wrap"><table><thead><tr><th>LÍNEA</th><th>SKU / PRODUCTO</th><th>UBICACIÓN</th><th>CANTIDAD</th><th>VALIDACIÓN</th></tr></thead><tbody>
+        {rows.slice(0, 12).map((row) => <tr key={row.lineNumber}><td>{row.lineNumber}</td><td><strong>{row.sku}</strong><small className="table-secondary">{row.productName}{row.isNew ? ' · Se creará' : ' · Existente'}</small></td><td>{row.locationCode}</td><td>{Number.isFinite(row.quantity) ? formatQuantity(row.quantity) : '—'}</td><td className={row.error ? 'bulk-import-error' : 'bulk-import-valid'}>{row.error || (row.isNew ? 'Producto nuevo' : 'Lista')}</td></tr>)}
+      </tbody></table></div>
+      {rows.length > 12 && <small className="field-help">Se muestran las primeras 12 líneas; el archivo completo se ha validado.</small>}
+      {invalidRows.length > 0 && <div className="bulk-import-issues" role="alert">
+        {invalidRows.slice(0, 20).map((row) => <span key={row.lineNumber}>Línea {row.lineNumber}: {row.error}</span>)}
+        {invalidRows.length > 20 && <span>Y {invalidRows.length - 20} errores más. Corrige el archivo y vuelve a cargarlo.</span>}
+      </div>}
+    </div>}
+    <label>Albarán o referencia común (opcional)<input maxLength={120} value={reference} onChange={(event) => setReference(event.target.value)} placeholder="Ej. Inventario inicial 2026" /></label>
+    <div className="form-actions"><button type="button" className="button button-secondary" onClick={onCancel}>Cancelar</button><button type="submit" className="button button-primary" disabled={saving || !rows.length || rows.some((row) => row.error)}>{saving ? 'Importando…' : <><Upload size={15} /> Registrar {rows.length} líneas</>}</button></div>
+  </form>;
 }
 
 function ProductForm({ initial, categories, suppliers, onSubmit, onCancel }: { initial: Product | null; categories: CatalogOption[]; suppliers: CatalogOption[]; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onCancel: () => void }) {

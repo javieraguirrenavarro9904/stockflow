@@ -523,11 +523,24 @@ tbody tr:last-child td { border-bottom: 0; }
 .form-actions { margin-top: 6px; padding-top: 14px; display: flex; justify-content: flex-end; gap: 8px; border-top: 1px solid #edf1ee; }
 .form-hint { margin: -4px 0 0; color: #87958c; font-size: 9px; }
 .field-help { display: block; color: #7d8b82; font-size: 9px; font-weight: 400; line-height: 1.45; }
+.bulk-receipt-form { min-width: 0; }
+.bulk-import-instructions { padding: 11px; display: grid; gap: 6px; border: 1px solid #e6eee8; border-radius: 6px; background: #f7faf7; }
+.bulk-import-instructions strong { color: #405248; font-size: 10px; }
+.bulk-import-instructions > span { color: #7d8b82; font-size: 9px; line-height: 1.5; }
+.bulk-import-instructions .text-button { justify-self: start; }
+.bulk-import-preview { display: grid; gap: 8px; }
+.bulk-import-preview .table-wrap { max-height: 260px; overflow: auto; }
+.bulk-import-preview table { min-width: 620px; }
+.bulk-import-summary { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 5px; color: #4a5a50; font-size: 9px; }
+.bulk-import-summary span { color: #87958c; }
+.bulk-import-issues { display: grid; gap: 4px; color: #a64e37; font-size: 9px; }
+.bulk-import-valid { color: #28845a; font-size: 9px; }
+.bulk-import-error { color: #a64e37; font-size: 9px; }
 .location-hint { padding: 9px 10px; border: 1px solid #e6eee8; border-radius: 6px; background: #f7faf7; }
 .form-error { margin: 0; color: #a64e37; font-size: 10px; }
 .movement-submit-error { margin: 0 0 14px; padding: 10px 12px; border: 1px solid #efc3b8; border-radius: 6px; background: #fff3ef; font-size: 12px; }
-.rack-bin-name { display: block; padding: 2px 5px; border-radius: 3px; background: #fff; color: #25362c; box-shadow: 0 1px 5px #10271a33; font-size: 9px; font-weight: 700; }
-.rack-bin-name.in-use { color: #79551f; background: #fff1d2; }
+.rack-bin-name { display: block; padding: 3px 7px; transform: rotate(-2deg); border: 1px solid #d8c99a; border-radius: 2px; background: linear-gradient(135deg, #fffdf2, #f8edc8); color: #25362c; box-shadow: 0 2px 4px #10271a40; font-size: 9px; font-weight: 700; }
+.rack-bin-name.in-use { border-color: #e6c58e; color: #79551f; background: #fff1d2; }
 .settings-grid { display: grid; grid-template-columns: minmax(300px, .9fr) minmax(0, 1.1fr); gap: 15px; align-items: start; }
 .settings-account, .team-panel, .employee-permissions, .catalog-management { overflow: hidden; }
 .catalog-management { grid-column: 1 / -1; }
