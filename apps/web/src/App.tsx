@@ -123,8 +123,11 @@ function formatNumber(value: string | number) {
 function formatQuantity(value: string | number) {
   return new Intl.NumberFormat('es-ES', { maximumFractionDigits: 2 }).format(number(value));
 }
+function locationSlotPosition(code: string) {
+  return /-H(\d+)$/.exec(code)?.[1] ?? code;
+}
 function locationLabel(location: Location) {
-  const position = location.code.split('-').at(-1) ?? location.code;
+  const position = locationSlotPosition(location.code);
   const level = location.level_number === 0 ? 'Suelo' : `Nivel ${String(location.level_number).padStart(2, '0')}`;
   const route = `${location.warehouse} · ${location.zone} · Pasillo ${location.aisle} · Estantería ${location.rack} · ${level} · Hueco ${position}`;
   return location.display_name ? `${location.display_name} · ${route}` : route;
@@ -1621,7 +1624,7 @@ export function LegacyMapPage({ locations, racks, selected, isAdmin, onSelect, o
                   <div className="map-rack-heading"><Layers size={15} /><strong>{rack.name}</strong><small>{formatNumber(rack.units)} uds.</small></div>
                   <div className="rack-shelves">{levels.map((level) => {
                     const levelBins = bins.filter((bin) => bin.level_number === level);
-                    return <div className="rack-shelf-row" key={level}><span className="shelf-level">{level === 0 ? 'Suelo' : String(level).padStart(2, '0')}</span><div className="rack-bin-list">{levelBins.map((bin) => <button key={bin.id} className={`rack-bin ${number(bin.quantity) > 0 ? 'filled' : ''} ${bin.in_use ? 'in-use' : ''} ${selected?.id === bin.id ? 'active' : ''}`} title={`${bin.code} · ${bin.in_use ? 'En uso · ubicación reservada' : `${formatNumber(bin.quantity)} unidades`}`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); setSelectedRackId(rack.id); onSelect(bin); }}>{bin.code.split('-').slice(-1)[0]}<small>{bin.in_use ? 'USO' : number(bin.quantity) > 0 ? formatNumber(bin.quantity) : '·'}</small></button>)}</div></div>;
+                    return <div className="rack-shelf-row" key={level}><span className="shelf-level">{level === 0 ? 'Suelo' : String(level).padStart(2, '0')}</span><div className="rack-bin-list">{levelBins.map((bin) => <button key={bin.id} className={`rack-bin ${number(bin.quantity) > 0 ? 'filled' : ''} ${bin.in_use ? 'in-use' : ''} ${selected?.id === bin.id ? 'active' : ''}`} title={`${bin.code} · ${bin.in_use ? 'En uso · ubicación reservada' : `${formatNumber(bin.quantity)} unidades`}`} onPointerDown={(event) => event.stopPropagation()} onClick={(event) => { event.stopPropagation(); setSelectedRackId(rack.id); onSelect(bin); }}>{locationSlotPosition(bin.code)}<small>{bin.in_use ? 'USO' : number(bin.quantity) > 0 ? formatNumber(bin.quantity) : '·'}</small></button>)}</div></div>;
                   })}</div>
                 </div>;
               })}

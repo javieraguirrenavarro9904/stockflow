@@ -993,6 +993,9 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
   const structureIds = new Set(layout.structures.map((structure) => structure.id));
   if (structureIds.size !== layout.structures.length)
     return res.status(400).json({ error: 'Hay identificadores de pared o puerta duplicados' });
+  const rackCodes = layout.racks.map((rack) => rack.code.toUpperCase());
+  if (new Set(rackCodes).size !== rackCodes.length)
+    return res.status(400).json({ error: 'Cada estantería del almacén debe tener un código distinto' });
   if (layout.racks.some((rack) => rack.levelHeights.length * rack.binsPerLevel * rack.depthSlots > 100))
     return res.status(400).json({ error: 'Una estantería no puede superar 100 ubicaciones' });
   if (layout.racks.some((rack) =>
@@ -1142,6 +1145,7 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
       const aisleId = aisleIds.get(rack.aisleId);
       if (!aisleId) throw Object.assign(new Error(`No se encontró el pasillo de la estantería ${rack.code}`), { status: 400 });
       const codePrefix = await getLocationCodePrefix(client, aisleId, warehouseId);
+      await assertRackCodeAvailable(client, warehouseId, rack.code, rack.id);
       if (rack.map_x + rack.map_width > layout.warehouse.map_width ||
           rack.map_y + rack.map_height > layout.warehouse.map_height ||
           !isRackWithinPerimeter({
@@ -1183,7 +1187,7 @@ app.put('/api/map-layout', requireAdmin, async (req, res, next) => {
           if (level.level_number > 0)
             await client.query('UPDATE rack_levels SET height_cm = $1 WHERE id = $2', [rack.levelHeights[level.level_number - 1], level.id]);
           const bins = await client.query(`
-            SELECT id, width_units, depth_position, substring(code from '-([0-9]+)$')::int AS slot_position
+            SELECT id, width_units, depth_position, substring(code from '-H([0-9]+)$')::int AS slot_position
             FROM bins WHERE rack_level_id = $1 ORDER BY depth_position, slot_position
           `, [level.id]);
           const existingPositions = new Set<string>();
@@ -1703,11 +1707,11 @@ function validateRackDimensions(
 const rackConfigSchema = z.object(rackConfigFields).superRefine(validateRackDimensions);
 const rackUpdateSchema = z.object(rackConfigFields).omit({ aisleId: true }).superRefine(validateRackDimensions);
 
-type LocationCodePrefix = { warehouse: string; zone: string; aisle: string };
+type LocationCodePrefix = { warehouse: string };
 
 async function getLocationCodePrefix(client: pg.PoolClient, aisleId: string, warehouseId: string): Promise<LocationCodePrefix> {
   const result = await client.query(`
-    SELECT w.code AS warehouse, z.code AS zone, a.code AS aisle
+    SELECT w.code AS warehouse
     FROM aisles a JOIN zones z ON z.id = a.zone_id JOIN warehouses w ON w.id = z.warehouse_id
     WHERE a.id = $1 AND w.id = $2
   `, [aisleId, warehouseId]);
@@ -1715,9 +1719,28 @@ async function getLocationCodePrefix(client: pg.PoolClient, aisleId: string, war
   return result.rows[0] as LocationCodePrefix;
 }
 
+async function assertRackCodeAvailable(
+  client: pg.PoolClient,
+  warehouseId: string,
+  rackCode: string,
+  excludedRackId?: string
+) {
+  const result = await client.query(`
+    SELECT 1
+    FROM racks r
+    JOIN aisles a ON a.id = r.aisle_id
+    JOIN zones z ON z.id = a.zone_id
+    WHERE z.warehouse_id = $1 AND upper(r.code) = upper($2)
+      AND ($3::uuid IS NULL OR r.id <> $3)
+    LIMIT 1
+  `, [warehouseId, rackCode, excludedRackId ?? null]);
+  if (result.rowCount)
+    throw Object.assign(new Error('Ya existe una estantería con ese código en este almacén'), { status: 409 });
+}
+
 function makeLocationCode(prefix: LocationCodePrefix, rackCode: string, level: number, position: number, depthPosition = 1) {
   const depthCode = depthPosition === 1 ? '' : `-D${String(depthPosition).padStart(2, '0')}`;
-  const code = `${prefix.warehouse}-${prefix.zone}-${prefix.aisle}-${rackCode}-${String(level).padStart(2, '0')}${depthCode}-${String(position).padStart(2, '0')}`;
+  const code = `${prefix.warehouse}-${rackCode}-N${String(level).padStart(2, '0')}${depthCode}-H${String(position).padStart(2, '0')}`;
   return { code, barcode: `LOC-${code}` };
 }
 
@@ -1810,6 +1833,7 @@ app.post('/api/racks', requireAdmin, async (req, res, next) => {
       x: config.map_x, y: config.map_y, width: config.map_width, height: config.map_height
     }, warehouse.rows[0]);
     const codePrefix = await getLocationCodePrefix(client, config.aisleId, res.locals.warehouseId as string);
+    await assertRackCodeAvailable(client, res.locals.warehouseId as string, config.code);
     const rack = await client.query(
       `INSERT INTO racks (aisle_id, name, code, map_x, map_y, map_width, map_height, depth_slots)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
@@ -1850,6 +1874,7 @@ app.patch('/api/racks/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, nex
     `, [req.params.id, res.locals.warehouseId]);
     if (!current.rowCount) throw Object.assign(new Error('Estantería no encontrada'), { status: 404 });
     const existing = current.rows[0] as { id: string; code: string; map_x: number; map_y: number; aisle_id: string; depth_slots: number; level_count: number; bins_per_level: number };
+    await assertRackCodeAvailable(client, res.locals.warehouseId as string, config.code, existing.id);
     const warehouse = current.rows[0] as { warehouse_width: number; warehouse_height: number; map_perimeter: MapPoint[]; map_structures: WarehouseStructure[] };
     assertRackFitsWarehouse({
       x: config.map_x, y: config.map_y, width: config.map_width, height: config.map_height
@@ -1892,7 +1917,7 @@ app.patch('/api/racks/:id([0-9a-fA-F-]{36})', requireAdmin, async (req, res, nex
       if (requestedLevelHeights && level.level_number > 0)
         await client.query('UPDATE rack_levels SET height_cm = $1 WHERE id = $2', [requestedLevelHeights[level.level_number - 1], level.id]);
       const bins = await client.query(`
-        SELECT id, width_units, depth_position, substring(code from '-([0-9]+)$')::int AS slot_position
+        SELECT id, width_units, depth_position, substring(code from '-H([0-9]+)$')::int AS slot_position
         FROM bins WHERE rack_level_id = $1 ORDER BY depth_position, slot_position
       `, [level.id]);
       const existingPositions = new Set<string>();
@@ -3071,7 +3096,7 @@ app.post('/api/assistant', async (req, res, next) => {
         SELECT p.sku, p.name, p.min_stock,
                concat_ws(' · ', w.name, z.name, 'Pasillo ' || a.code, 'Estantería ' || r.code,
                  CASE WHEN rl.level_number = 0 THEN 'Suelo' ELSE 'Nivel ' || lpad(rl.level_number::text, 2, '0') END,
-                 'Hueco ' || substring(b.code FROM '[^-]+$')) AS location,
+                 'Hueco ' || substring(b.code FROM '-H([0-9]+)$')) AS location,
                sb.quantity, sb.reserved_quantity, l.lot_code, l.expires_at
         FROM products p
         LEFT JOIN stock_balances sb ON sb.product_id = p.id
@@ -3148,7 +3173,7 @@ app.post('/api/assistant', async (req, res, next) => {
         SELECT p.name, p.sku,
                concat_ws(' · ', w.name, z.name, 'Pasillo ' || a.code, 'Estantería ' || r.code,
                  CASE WHEN rl.level_number = 0 THEN 'Suelo' ELSE 'Nivel ' || lpad(rl.level_number::text, 2, '0') END,
-                 'Hueco ' || substring(b.code FROM '[^-]+$')) AS location,
+                 'Hueco ' || substring(b.code FROM '-H([0-9]+)$')) AS location,
                sum(sb.quantity)::numeric AS quantity
         FROM products p JOIN stock_balances sb ON sb.product_id = p.id
         JOIN bins b ON b.id = sb.bin_id
@@ -3283,6 +3308,10 @@ async function start() {
     ));
     await pool.query(readFileSync(
       resolve(apiRoot, 'src/db/migrations/012-warehouse-catalog-and-in-use.sql'),
+      'utf8'
+    ));
+    await pool.query(readFileSync(
+      resolve(apiRoot, 'src/db/migrations/013-location-code-format.sql'),
       'utf8'
     ));
     await pool.query(`

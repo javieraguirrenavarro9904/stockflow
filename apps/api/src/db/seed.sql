@@ -19,8 +19,8 @@ SELECT r.id, levels.level_number FROM racks r CROSS JOIN generate_series(1, 3) A
 ON CONFLICT (rack_id, level_number) DO NOTHING;
 
 INSERT INTO bins (rack_level_id, code, barcode, map_x, map_y)
-SELECT rl.id, 'A1-' || lpad(rl.level_number::text, 2, '0') || '-' || b.bin_num,
-       'LOC-' || 'A1-' || lpad(rl.level_number::text, 2, '0') || '-' || b.bin_num,
+SELECT rl.id, 'MAD-01-A1-N' || lpad(rl.level_number::text, 2, '0') || '-H' || lpad(b.bin_num::text, 2, '0'),
+       'LOC-MAD-01-A1-N' || lpad(rl.level_number::text, 2, '0') || '-H' || lpad(b.bin_num::text, 2, '0'),
        40 + (b.bin_num::int - 1) * 112, 40 + (rl.level_number - 1) * 84
 FROM rack_levels rl
 JOIN racks r ON r.id = rl.rack_id
