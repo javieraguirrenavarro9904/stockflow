@@ -549,7 +549,6 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
       type, productId: type === 'return' ? undefined : form.get('productId'), quantity: Number(form.get('quantity')),
       loanId: type === 'return' ? form.get('loanId') : undefined,
       lotCode: lotCode || undefined, expiresAt: expiresAt || undefined,
-      binName: form.get('binName') || undefined,
       binWidthUnits: form.get('binWidthUnits') ? Number(form.get('binWidthUnits')) : undefined,
       binDepthUnits: form.get('binDepthUnits') ? Number(form.get('binDepthUnits')) : undefined,
       reference: form.get('reference') || undefined,
@@ -609,21 +608,6 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
     }
   };
 
-  const saveLocationName = async (locationId: string, displayName: string | null): Promise<boolean> => {
-    try {
-      await request(`/locations/${locationId}/display-name`, {
-        method: 'PATCH',
-        body: JSON.stringify({ displayName })
-      });
-      await refresh();
-      notify('Nombre de caja actualizado');
-      return true;
-    } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'No se pudo actualizar el nombre de la caja');
-      return false;
-    }
-  };
-
   const createPurchaseOrders = async (lines: { productId: string; quantity: number }[]): Promise<boolean> => {
     try {
       const created = await request<{ id: string }[]>('/purchase-orders', {
@@ -638,7 +622,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
     }
   };
 
-  const receivePurchaseOrder = async (orderId: string, lines: { lineId: string; binId: string; binName?: string; lotCode?: string; expiresAt?: string }[]): Promise<boolean> => {
+  const receivePurchaseOrder = async (orderId: string, lines: { lineId: string; binId: string; lotCode?: string; expiresAt?: string }[]): Promise<boolean> => {
     try {
       await request(`/purchase-orders/${orderId}/receive`, {
         method: 'POST', body: JSON.stringify({ lines })
@@ -841,7 +825,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
             try { await request(`/products/${id}`, { method: 'DELETE' }); await refresh(); notify('Producto archivado'); }
             catch (reason) { setError(reason instanceof Error ? reason.message : 'No se pudo archivar'); }
           }} />}
-          {page === 'map' && warehouseMap && <MapPage products={products} locations={locations} racks={racks} warehouse={warehouseMap} aisles={aisles} selected={selectedLocation} initialRackId={qrRackId} isAdmin={isAdmin} onSelect={setSelectedLocation} onRefresh={refresh} onNotify={notify} onMoveStock={(location) => { setMovementDefaults({ type: isAdmin ? 'transfer' : 'in_use', fromBinId: location.id }); setMovementError(''); setModal('movement'); }} onSaveExpected={saveExpectedContent} onSaveLocationName={saveLocationName} onEditingChange={setMapEditing} />}
+          {page === 'map' && warehouseMap && <MapPage products={products} locations={locations} racks={racks} warehouse={warehouseMap} aisles={aisles} selected={selectedLocation} initialRackId={qrRackId} isAdmin={isAdmin} onSelect={setSelectedLocation} onRefresh={refresh} onNotify={notify} onMoveStock={(location) => { setMovementDefaults({ type: isAdmin ? 'transfer' : 'in_use', fromBinId: location.id }); setMovementError(''); setModal('movement'); }} onSaveExpected={saveExpectedContent} onEditingChange={setMapEditing} />}
           {page === 'movements' && <MovementsPage movements={movements} onAdd={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onExport={() => downloadCsv('movimientos.csv', [['Tipo', 'Referencia', 'Productos', 'Unidades', 'Fecha'], ...movements.map((item) => [movementNames[item.type] ?? item.type, item.reference, item.products, item.units, item.created_at])])} />}
           {page === 'purchasing' && <PurchasingPage suggestions={replenishment} orders={purchaseOrders} locations={locations} isAdmin={isAdmin} onCreateOrder={createPurchaseOrders} onReceiveOrder={receivePurchaseOrder} onCancelOrder={cancelPurchaseOrder} />}
           {page === 'salesOrders' && <SalesOrdersPage orders={salesOrders} products={products} locations={locations} isAdmin={isAdmin} onCreateOrder={createSalesOrder} onStartPicking={(id) => changeSalesOrder(id, 'picking')} onFulfill={(id) => changeSalesOrder(id, 'fulfill')} onCancelOrder={(id) => changeSalesOrder(id, 'cancel')} />}
@@ -1302,28 +1286,22 @@ function RackCreationForm({ initialAisleId, initialWidth, initialDepth, maxWidth
   </form>;
 }
 
-function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin, editing, saving, onBack, onSelect, onMoveStock, onSaveExpected, onSaveLocationName, onChange, onDelete, onSave, onDiscard }: {
+function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin, editing, saving, onBack, onSelect, onMoveStock, onSaveExpected, onChange, onDelete, onSave, onDiscard }: {
   rack: Rack; locations: Location[]; selected: Location | null; products: Product[]; warehouseId: string;
   isAdmin: boolean; editing: boolean; saving: boolean;
   onBack: () => void; onSelect: (location: Location | null) => void;
   onMoveStock: (location: Location) => void;
   onSaveExpected: (locationId: string, expected: { productId: string; quantity: number }[]) => Promise<boolean>;
-  onSaveLocationName: (locationId: string, displayName: string | null) => Promise<boolean>;
   onChange: (field: string, value: string | number) => void;
   onDelete: () => void; onSave: () => void; onDiscard: () => void
 }) {
   const showExpectedContent = false; // Temporarily disabled; keep the comparison available to re-enable later.
   const [editingExpectedLocationId, setEditingExpectedLocationId] = useState<string | null>(null);
   const [qrLabelsOpen, setQrLabelsOpen] = useState(false);
-  const [nameSaving, setNameSaving] = useState(false);
-  const [displayName, setDisplayName] = useState(selected?.display_name ?? '');
   useEffect(() => {
     setEditingExpectedLocationId(null);
   }, [rack.id, selected?.level_number]);
   const currentBin = selected?.rack_id === rack.id ? selected : null;
-  useEffect(() => {
-    setDisplayName(currentBin?.display_name ?? '');
-  }, [currentBin?.id, currentBin?.display_name]);
 
   return <>
     <PageIntro eyebrow="VISTA 3D" title={rack.name} description={`${rack.level_count} niveles · ${rack.bins_per_level} huecos por nivel`} actions={<>
@@ -1345,14 +1323,6 @@ function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin,
               <h3>Existencias reales</h3>{currentBin.products.filter((product) => number(product.quantity) > 0).map((product) => <div className="location-product" key={`${product.productId}-${product.lot}`}><span className="product-thumb thumb-0"><Package size={16} /></span><span><strong>{product.name}</strong><small>{product.sku}{product.lot ? ` · Lote ${product.lot}` : ''}</small></span><b>{formatNumber(product.quantity)} uds.</b></div>)}
               {!currentBin.products.some((product) => number(product.quantity) > 0) && <div className="location-empty">{currentBin.in_use ? 'El artículo está en uso y el hueco queda reservado.' : 'Este hueco está vacío.'}</div>}
             </div>{showExpectedContent && <ExpectedContentsPanel location={currentBin} />}
-            {isAdmin && <form className="bin-name-editor" onSubmit={(event) => {
-              event.preventDefault();
-              setNameSaving(true);
-              void onSaveLocationName(currentBin.id, displayName.trim() || null).finally(() => setNameSaving(false));
-            }}>
-              <label>Nombre de la caja<input maxLength={100} value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder={currentBin.code} /></label>
-              <button type="submit" className="button button-secondary full-button" disabled={nameSaving || displayName.trim() === (currentBin.display_name ?? '')}>{nameSaving ? 'Guardando…' : 'Guardar nombre de caja'}</button>
-            </form>}
             {showExpectedContent && isAdmin && <button className="button button-secondary full-button" onClick={() => setEditingExpectedLocationId(currentBin.id)}><Pencil size={14} /> Editar contenido esperado</button>}
             {showExpectedContent && editingExpectedLocationId === currentBin.id && <ExpectedContentEditor key={currentBin.id} location={currentBin} products={products} onSave={onSaveExpected} onCancel={() => setEditingExpectedLocationId(null)} />}
             <button className="button button-primary full-button" disabled={!currentBin.products.some((product) => number(product.quantity) > 0)} onClick={() => onMoveStock(currentBin)}><ArrowLeftRight size={15} /> Mover productos</button>
@@ -1666,12 +1636,11 @@ export function LegacyMapPage({ locations, racks, selected, isAdmin, onSelect, o
   </>;
 }
 
-function MapPage({ products, locations, racks, warehouse, aisles, selected, initialRackId, isAdmin, onSelect, onRefresh, onNotify, onMoveStock, onSaveExpected, onSaveLocationName, onEditingChange }: {
+function MapPage({ products, locations, racks, warehouse, aisles, selected, initialRackId, isAdmin, onSelect, onRefresh, onNotify, onMoveStock, onSaveExpected, onEditingChange }: {
   products: Product[]; locations: Location[]; racks: Rack[]; warehouse: WarehouseMap; aisles: Aisle[];
   selected: Location | null; initialRackId: string | null; isAdmin: boolean; onSelect: (location: Location | null) => void;
   onRefresh: () => Promise<void>; onNotify: (message: string) => void; onMoveStock: (location: Location) => void;
   onSaveExpected: (locationId: string, expected: { productId: string; quantity: number }[]) => Promise<boolean>;
-  onSaveLocationName: (locationId: string, displayName: string | null) => Promise<boolean>;
   onEditingChange: (editing: boolean) => void
 }) {
   const [editMode, setEditMode] = useState(false);
@@ -2074,7 +2043,6 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
     onSelect={onSelect}
     onMoveStock={onMoveStock}
     onSaveExpected={onSaveExpected}
-    onSaveLocationName={onSaveLocationName}
     onChange={(field, value) => updateRack(selectedRack.id, field, value)}
     onDelete={() => removeRack(selectedRack)}
     onSave={() => void saveLayout()}
@@ -2618,7 +2586,6 @@ function MovementForm({ products, locations, racks, warehouses, inUseLoans, curr
       </div>
       <label>Cantidad<input required name="quantity" type="number" min="0.01" max={type === 'return' ? selectedLoan?.remaining_quantity : undefined} step="0.01" placeholder={type === 'return' ? String(selectedLoan?.remaining_quantity ?? '0') : '0'} defaultValue={type === 'return' ? selectedLoan?.remaining_quantity : undefined} autoFocus /></label>
         {toBinId && selectedDestination && isEmpty(selectedDestination) && <>
-          <label>Nombre de la caja (opcional)<input name="binName" maxLength={100} placeholder="Ej. Caja azul · tornillería M8" /><small className="field-help">Se guardará en esta ubicación y aparecerá en el visor 3D.</small></label>
           <label>Tamaño de la caja<select name="binWidthUnits" defaultValue={selectedDestination.width_units}>
             {Array.from({ length: Math.min(12, (destinationRacks.find((rack) => rack.id === selectedDestination.rack_id)?.bins_per_level ?? 1) - selectedDestination.slot_position + 1) }, (_value, index) => index + 1).map((units) => <option key={units} value={units}>{units} {units === 1 ? 'hueco' : 'huecos'} seguidos</option>)}
           </select><small className="field-help">Huecos contiguos hacia la derecha.</small></label>

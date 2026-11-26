@@ -1339,7 +1339,7 @@ app.get('/api/locations', async (req, res, next) => {
       return res.status(400).json({ error: 'Identificador de almacén no válido' });
     const warehouseId = requestedWarehouse.success ? requestedWarehouse.data : res.locals.warehouseId as string;
     const result = await pool.query(`
-      SELECT b.id, b.code, b.barcode, b.capacity, b.display_name, b.map_x, b.map_y, b.map_width, b.map_height,
+      SELECT b.id, b.code, b.barcode, b.capacity, box_name.display_name, b.map_x, b.map_y, b.map_width, b.map_height,
              b.width_units, b.depth_units, b.depth_position, substring(b.code from '-H([0-9]+)$')::int AS slot_position, b.status,
              z.warehouse_id, w.name AS warehouse,
              z.name AS zone, a.id AS aisle_id, a.code AS aisle, r.id AS rack_id, r.code AS rack, rl.level_number,
@@ -1352,7 +1352,7 @@ app.get('/api/locations', async (req, res, next) => {
              ) AS in_use,
              COALESCE(json_agg(json_build_object(
                'productId', p.id, 'sku', p.sku, 'name', p.name, 'quantity', sb.quantity, 'lot', l.lot_code
-             )) FILTER (WHERE p.id IS NOT NULL), '[]') AS products,
+             )) FILTER (WHERE p.id IS NOT NULL AND sb.quantity > 0), '[]') AS products,
              COALESCE((
                SELECT json_agg(json_build_object(
                  'productId', expected_product.id, 'sku', expected_product.sku, 'name', expected_product.name,
@@ -1371,8 +1371,30 @@ app.get('/api/locations', async (req, res, next) => {
       LEFT JOIN stock_balances sb ON sb.bin_id = b.id
       LEFT JOIN products p ON p.id = sb.product_id
       LEFT JOIN lots l ON l.id = sb.lot_id
+      LEFT JOIN LATERAL (
+        SELECT string_agg(contents.name, ', ' ORDER BY contents.first_stored_at, contents.name) AS display_name
+        FROM (
+          SELECT named_products.name, min(named_products.first_stored_at) AS first_stored_at
+          FROM (
+            SELECT p2.id, p2.name,
+                   COALESCE(
+                     (SELECT min(m.created_at)
+                      FROM movement_lines ml
+                      JOIN movements m ON m.id = ml.movement_id
+                      WHERE ml.to_bin_id = b.id
+                        AND COALESCE(ml.destination_product_id, ml.product_id) = p2.id),
+                     min(sb2.updated_at)
+                   ) AS first_stored_at
+            FROM stock_balances sb2
+            JOIN products p2 ON p2.id = sb2.product_id
+            WHERE sb2.bin_id = b.id AND sb2.quantity > 0
+            GROUP BY p2.id, p2.name
+          ) named_products
+          GROUP BY named_products.name
+        ) contents
+      ) box_name ON true
       WHERE z.warehouse_id = $1 AND b.merged_into_bin_id IS NULL
-      GROUP BY b.id, z.name, a.id, a.code, r.id, r.code, rl.level_number, z.warehouse_id, w.name
+      GROUP BY b.id, box_name.display_name, z.name, a.id, a.code, r.id, r.code, rl.level_number, z.warehouse_id, w.name
       ORDER BY b.map_y, b.map_x, b.code
     `, [warehouseId]);
     res.json(result.rows);
@@ -1561,32 +1583,6 @@ app.put('/api/locations/:id/width', requireAdmin, async (req, res, next) => {
     next(error);
   } finally {
     client.release();
-  }
-});
-
-const binDisplayNameSchema = z.object({
-  displayName: z.string().trim().min(1).max(100).nullable()
-});
-
-app.patch('/api/locations/:id/display-name', requireAdmin, async (req, res, next) => {
-  const parsedId = z.string().uuid().safeParse(req.params.id);
-  const parsed = binDisplayNameSchema.safeParse(req.body);
-  if (!parsedId.success) return res.status(400).json({ error: 'Identificador de ubicación no válido' });
-  if (!parsed.success) return res.status(400).json({ error: 'Nombre de caja no válido' });
-  try {
-    const updated = await pool.query(`
-      UPDATE bins b SET display_name = $1
-      FROM rack_levels rl, racks r, aisles a, zones z
-      WHERE b.id = $2 AND b.merged_into_bin_id IS NULL
-        AND rl.id = b.rack_level_id AND r.id = rl.rack_id AND a.id = r.aisle_id
-        AND z.id = a.zone_id AND z.warehouse_id = $3
-      RETURNING b.id
-    `, [parsed.data.displayName, parsedId.data, res.locals.warehouseId]);
-    if (!updated.rowCount)
-      throw Object.assign(new Error('La ubicación no pertenece al almacén activo'), { status: 404 });
-    res.json({ saved: true });
-  } catch (error) {
-    next(error);
   }
 });
 
@@ -2090,7 +2086,7 @@ app.get('/api/in-use', async (_req, res, next) => {
              loan.quantity, loan.returned_quantity,
              (loan.quantity - loan.returned_quantity)::numeric AS remaining_quantity,
              l.lot_code, m.reference, m.created_at,
-             COALESCE(b.display_name, b.code) AS original_location
+             b.code AS original_location
       FROM in_use_loans loan
       JOIN movement_lines ml ON ml.id = loan.movement_line_id
       JOIN movements m ON m.id = ml.movement_id
@@ -2118,7 +2114,6 @@ const movementSchema = z.object({
   quantity: z.coerce.number().positive(),
   fromBinId: z.string().uuid().optional(),
   toBinId: z.string().uuid().optional(),
-  binName: z.string().trim().min(1).max(100).optional(),
   binWidthUnits: z.coerce.number().int().min(1).max(12).optional(),
   binDepthUnits: z.coerce.number().int().min(1).max(12).optional(),
   destinationWarehouseId: z.string().uuid().optional(),
@@ -2146,8 +2141,6 @@ const movementSchema = z.object({
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['loanId'], message: 'Solo una devolución puede indicar un préstamo' });
   if (data.type === 'return' && (data.fromBinId || data.lotCode || data.expiresAt))
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['loanId'], message: 'La devolución usa el producto y lote del artículo prestado' });
-  if (data.binName && !data.toBinId)
-    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['binName'], message: 'El nombre de la caja requiere una ubicación de destino' });
   if (data.binWidthUnits !== undefined && !data.toBinId)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['binWidthUnits'], message: 'El tamaño de caja requiere una ubicación de destino' });
   if (data.binDepthUnits !== undefined && !data.toBinId)
@@ -2240,7 +2233,7 @@ app.post('/api/movements', async (req, res, next) => {
       JOIN racks r ON r.id = rl.rack_id JOIN aisles a ON a.id = r.aisle_id
       JOIN zones z ON z.id = a.zone_id
       WHERE b.id = ANY($1::uuid[])
-      ${destinationBin || input.type === 'in_use' || input.binName || input.binWidthUnits !== undefined || input.binDepthUnits !== undefined ? 'FOR UPDATE OF b' : 'FOR SHARE OF b'}
+      ${destinationBin || input.type === 'in_use' || input.binWidthUnits !== undefined || input.binDepthUnits !== undefined ? 'FOR UPDATE OF b' : 'FOR SHARE OF b'}
     `, [requestedBins]) : { rows: [] as { id: string; warehouse_id: string; status: string }[], rowCount: 0 };
     const binById = new Map(binWarehouses.rows.map((bin) => [bin.id, bin]));
     if (requestedBins.some((id) => binById.get(id)?.merged_into_bin_id))
@@ -2267,15 +2260,6 @@ app.post('/api/movements', async (req, res, next) => {
     }
     if ((input.binWidthUnits !== undefined || input.binDepthUnits !== undefined) && destinationBin)
       await setBinWidth(client, destinationBin, destinationWarehouseId, input.binWidthUnits, input.binDepthUnits);
-    if (input.binName && destinationBin) {
-      const destinationStock = await client.query(
-        'SELECT id FROM stock_balances WHERE bin_id = $1 AND quantity > 0 FOR UPDATE',
-        [destinationBin]
-      );
-      if (destinationStock.rowCount)
-        throw Object.assign(new Error('Solo se puede asignar nombre a una ubicación vacía'), { status: 409 });
-      await client.query('UPDATE bins SET display_name = $1 WHERE id = $2', [input.binName, destinationBin]);
-    }
     const decreasesStock = Boolean(sourceBin);
     let allocations: {
       lotId: string | null;
@@ -2688,7 +2672,6 @@ const receivePurchaseOrderSchema = z.object({
   lines: z.array(z.object({
     lineId: z.string().uuid(),
     binId: z.string().uuid(),
-    binName: z.string().trim().min(1).max(100).optional(),
     lotCode: z.string().trim().min(1).max(100).optional(),
     expiresAt: z.string().refine(
       (value) => !Number.isNaN(Date.parse(value)) && new Date(value).toISOString().slice(0, 10) === value,
@@ -2734,15 +2717,6 @@ app.post('/api/purchase-orders/:id/receive', requireAdmin, async (req, res, next
     if (orderLines.rows.some((line) => !receiptByLine.has(line.id)))
       throw Object.assign(new Error('La recepción debe incluir todas las líneas del pedido'), { status: 400 });
 
-    const namedBins = new Map<string, string>();
-    for (const receipt of parsed.data.lines) {
-      if (!receipt.binName) continue;
-      const previousName = namedBins.get(receipt.binId);
-      if (previousName && previousName !== receipt.binName)
-        throw Object.assign(new Error('Una ubicación no puede tener varios nombres de caja'), { status: 400 });
-      namedBins.set(receipt.binId, receipt.binName);
-    }
-
     const binIds = parsed.data.lines.map((line) => line.binId);
     const bins = await client.query(`
       SELECT b.id, b.status, b.merged_into_bin_id, z.warehouse_id
@@ -2767,16 +2741,6 @@ app.post('/api/purchase-orders/:id/receive', requireAdmin, async (req, res, next
     );
     if (reservedBin.rowCount)
       throw Object.assign(new Error('Una ubicación seleccionada está reservada por un artículo En uso'), { status: 409 });
-
-    for (const [binId, binName] of namedBins) {
-      const destinationStock = await client.query(
-        'SELECT id FROM stock_balances WHERE bin_id = $1 AND quantity > 0 FOR UPDATE',
-        [binId]
-      );
-      if (destinationStock.rowCount)
-        throw Object.assign(new Error('Solo se puede asignar nombre a una ubicación vacía'), { status: 409 });
-      await client.query('UPDATE bins SET display_name = $1 WHERE id = $2', [binName, binId]);
-    }
 
     const orderReference = `PO-${parsedId.data.slice(0, 8).toUpperCase()}`;
     const movement = await client.query(
