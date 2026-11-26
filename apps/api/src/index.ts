@@ -3125,6 +3125,7 @@ app.post('/api/assistant', async (req, res, next) => {
         ORDER BY CASE WHEN cardinality($2::text[]) > 0 AND (
           SELECT count(*) FROM unnest($2::text[]) AS query_term(term)
           WHERE p.name ILIKE '%' || query_term.term || '%'
+             OR to_tsvector('spanish', p.name) @@ plainto_tsquery('spanish', query_term.term)
              OR p.sku ILIKE '%' || query_term.term || '%'
         ) = cardinality($2::text[]) THEN 0 ELSE 1 END,
           p.name, l.received_at ASC NULLS LAST
@@ -3207,6 +3208,7 @@ app.post('/api/assistant', async (req, res, next) => {
             cardinality($1::text[]) = 0
             OR (SELECT count(*) FROM unnest($1::text[]) AS query_term(term)
                 WHERE p.name ILIKE '%' || query_term.term || '%'
+                   OR to_tsvector('spanish', p.name) @@ plainto_tsquery('spanish', query_term.term)
                    OR p.sku ILIKE '%' || query_term.term || '%') = cardinality($1::text[])
           )
         GROUP BY p.name, p.sku, w.name, z.name, a.code, r.code, rl.level_number, b.code ORDER BY p.name LIMIT 10
