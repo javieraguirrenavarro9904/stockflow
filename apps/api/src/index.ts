@@ -1503,7 +1503,7 @@ async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: st
       SELECT b.id, b.width_units, b.depth_position, b.merged_into_bin_id, b.status,
              substring(b.code from '-H([0-9]+)$')::int AS slot_position
       FROM bins b WHERE b.rack_level_id = $1 ORDER BY b.depth_position, slot_position FOR UPDATE
-    `, [anchor.rack_level_id, anchor.depth_position]);
+    `, [anchor.rack_level_id]);
   if (anchor.slot_position + requestedWidthUnits - 1 > anchor.slots_per_level)
     throw Object.assign(new Error('No hay suficientes huecos contiguos a la derecha para ese tamaño'), { status: 400 });
   if (anchor.depth_position + requestedDepthUnits - 1 > anchor.rack_depth_slots)
