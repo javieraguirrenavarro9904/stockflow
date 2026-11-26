@@ -44,7 +44,7 @@ type Location = {
   id: string; code: string; barcode: string | null; capacity: string | null; display_name: string | null;
   warehouse_id: string; warehouse: string;
   map_x: string | number; map_y: string | number; map_width: string | number; map_height: string | number;
-  width_units: number; slot_position: number; depth_position: number;
+  width_units: number; depth_units: number; slot_position: number; depth_position: number;
   status: string; in_use: boolean; zone: string; aisle_id: string; aisle: string; rack_id: string; rack: string; level_number: number;
   quantity: string | number; products: { productId: string; sku: string; name: string; quantity: string | number; lot: string | null }[];
   expected_products: ExpectedProduct[];
@@ -551,6 +551,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
       lotCode: lotCode || undefined, expiresAt: expiresAt || undefined,
       binName: form.get('binName') || undefined,
       binWidthUnits: form.get('binWidthUnits') ? Number(form.get('binWidthUnits')) : undefined,
+      binDepthUnits: form.get('binDepthUnits') ? Number(form.get('binDepthUnits')) : undefined,
       reference: form.get('reference') || undefined,
       destinationWarehouseId: type === 'transfer' ? form.get('destinationWarehouseId') : undefined
     };
@@ -2620,7 +2621,10 @@ function MovementForm({ products, locations, racks, warehouses, inUseLoans, curr
           <label>Nombre de la caja (opcional)<input name="binName" maxLength={100} placeholder="Ej. Caja azul · tornillería M8" /><small className="field-help">Se guardará en esta ubicación y aparecerá en el visor 3D.</small></label>
           <label>Tamaño de la caja<select name="binWidthUnits" defaultValue={selectedDestination.width_units}>
             {Array.from({ length: Math.min(12, (destinationRacks.find((rack) => rack.id === selectedDestination.rack_id)?.bins_per_level ?? 1) - selectedDestination.slot_position + 1) }, (_value, index) => index + 1).map((units) => <option key={units} value={units}>{units} {units === 1 ? 'hueco' : 'huecos'} seguidos</option>)}
-          </select><small className="field-help">Se crea ocupando huecos contiguos a la derecha en la misma balda. Solo se puede hacer con huecos vacíos.</small></label>
+          </select><small className="field-help">Huecos contiguos hacia la derecha.</small></label>
+          <label>Fondo de la caja<select name="binDepthUnits" defaultValue={selectedDestination.depth_units}>
+            {Array.from({ length: Math.max(1, (destinationRacks.find((rack) => rack.id === selectedDestination.rack_id)?.depth_slots ?? 1) - selectedDestination.depth_position + 1) }, (_value, index) => index + 1).map((units) => <option key={units} value={units}>{units} {units === 1 ? 'fila de fondo' : 'filas de fondo'}</option>)}
+          </select><small className="field-help">Puede ocupar huecos alineados desde el frente hacia el fondo. Todas las ubicaciones afectadas deben estar vacías.</small></label>
         </>}
       {type === 'return'
         ? <p className="form-hint">Se conservará el lote original{selectedLoan?.lot_code ? ` ${selectedLoan.lot_code}` : ''} del artículo.</p>

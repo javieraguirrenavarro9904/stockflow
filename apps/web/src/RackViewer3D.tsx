@@ -11,6 +11,7 @@ type RackLocation = {
   slot_position: number;
   depth_position: number;
   width_units: number;
+  depth_units: number;
   quantity: string | number;
   in_use: boolean;
   products: { productId: string; sku: string; name: string; quantity: string | number; lot: string | null }[];
@@ -79,7 +80,7 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
   const depthSlots = Math.max(1, rack.depth_slots || 1);
   const usableDepth = depth * 0.72;
   const depthPitch = usableDepth / depthSlots;
-  const boxDepth = depthSlots === 1 ? usableDepth : Math.max(0.05, depthPitch * 0.9);
+  const depthGap = Math.min(0.06, depthPitch * 0.1);
 
   return (
     <>
@@ -117,7 +118,9 @@ function RackScene({ rack, locations, selectedId, onSelectProduct, productId, se
         const levelY = levelPositions[levelIndex] ?? 1;
         const x = -width / 2 + uprightWidth + slotPitch * (location.slot_position - 1 + location.width_units / 2);
         const depthIndex = Math.max(0, Math.min(depthSlots - 1, location.depth_position - 1));
-        const z = usableDepth / 2 - depthPitch * (depthIndex + 0.5);
+        const depthUnits = Math.max(1, Math.min(depthSlots - depthIndex, location.depth_units || 1));
+        const z = usableDepth / 2 - depthPitch * (depthIndex + depthUnits / 2);
+        const boxDepth = Math.max(0.05, depthPitch * depthUnits - depthGap);
         const slotWidth = slotPitch * location.width_units - boxGap;
         const levelSpacing = Math.max(0.01, number(rack.level_heights[levelIndex] ?? 240) / 100);
         const boxHeight = isFloor ? floorBoxHeight : Math.min(0.62, Math.max(0.12, levelSpacing * 0.65));

@@ -92,10 +92,13 @@ CREATE TABLE IF NOT EXISTS bins (
   map_height NUMERIC(7, 2) NOT NULL DEFAULT 64,
   display_name TEXT,
   width_units SMALLINT NOT NULL DEFAULT 1 CHECK (width_units BETWEEN 1 AND 12),
+  depth_units SMALLINT NOT NULL DEFAULT 1 CHECK (depth_units BETWEEN 1 AND 12),
   depth_position SMALLINT NOT NULL DEFAULT 1 CHECK (depth_position BETWEEN 1 AND 12),
   merged_into_bin_id UUID REFERENCES bins(id) ON DELETE SET NULL,
   CONSTRAINT bins_merged_into_not_self CHECK (merged_into_bin_id IS NULL OR merged_into_bin_id <> id),
-  CONSTRAINT bins_merged_children_single_unit CHECK (merged_into_bin_id IS NULL OR width_units = 1),
+  CONSTRAINT bins_merged_children_single_unit CHECK (
+    merged_into_bin_id IS NULL OR (width_units = 1 AND depth_units = 1)
+  ),
   status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'blocked'))
 );
 

@@ -1340,7 +1340,7 @@ app.get('/api/locations', async (req, res, next) => {
     const warehouseId = requestedWarehouse.success ? requestedWarehouse.data : res.locals.warehouseId as string;
     const result = await pool.query(`
       SELECT b.id, b.code, b.barcode, b.capacity, b.display_name, b.map_x, b.map_y, b.map_width, b.map_height,
-             b.width_units, b.depth_position, substring(b.code from '-H([0-9]+)$')::int AS slot_position, b.status,
+             b.width_units, b.depth_units, b.depth_position, substring(b.code from '-H([0-9]+)$')::int AS slot_position, b.status,
              z.warehouse_id, w.name AS warehouse,
              z.name AS zone, a.id AS aisle_id, a.code AS aisle, r.id AS rack_id, r.code AS rack, rl.level_number,
              COALESCE(sum(sb.quantity), 0)::numeric AS quantity,
@@ -1443,13 +1443,14 @@ app.put('/api/locations/:id/expected-content', requireAdmin, async (req, res, ne
 });
 
 const binWidthSchema = z.object({
-  widthUnits: z.coerce.number().int().min(1).max(12)
-});
+  widthUnits: z.coerce.number().int().min(1).max(12).optional(),
+  depthUnits: z.coerce.number().int().min(1).max(12).optional()
+}).refine((value) => value.widthUnits !== undefined || value.depthUnits !== undefined);
 
-async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: string, widthUnits: number) {
+async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: string, widthUnits?: number, depthUnits?: number) {
   const selected = await client.query(`
-      SELECT b.id, b.rack_level_id, b.width_units, b.merged_into_bin_id, b.status,
-             r.map_width AS rack_map_width,
+      SELECT b.id, b.rack_level_id, b.width_units, b.depth_units, b.merged_into_bin_id, b.status,
+             r.map_width AS rack_map_width, r.depth_slots AS rack_depth_slots,
              (SELECT count(*)::int FROM bins level_bins
               WHERE level_bins.rack_level_id = b.rack_level_id
                 AND level_bins.depth_position = b.depth_position) AS slots_per_level,
@@ -1465,23 +1466,36 @@ async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: st
   if (!selected.rowCount)
     throw Object.assign(new Error('La ubicación no pertenece al almacén activo'), { status: 404 });
   const anchor = selected.rows[0] as {
-      id: string; rack_level_id: string; width_units: number; merged_into_bin_id: string | null;
-      status: string; slot_position: number; depth_position: number; rack_map_width: number; slots_per_level: number
+      id: string; rack_level_id: string; width_units: number; depth_units: number; merged_into_bin_id: string | null;
+      status: string; slot_position: number; depth_position: number; rack_map_width: number;
+      rack_depth_slots: number; slots_per_level: number
     };
   if (anchor.merged_into_bin_id)
     throw Object.assign(new Error('Selecciona un hueco principal para crear la caja'), { status: 409 });
   if (anchor.status !== 'active')
     throw Object.assign(new Error('No se puede cambiar el tamaño de una ubicación bloqueada'), { status: 409 });
+  const requestedWidthUnits = widthUnits ?? anchor.width_units;
+  const requestedDepthUnits = depthUnits ?? anchor.depth_units;
 
   const slots = await client.query(`
       SELECT b.id, b.width_units, b.depth_position, b.merged_into_bin_id, b.status,
              substring(b.code from '-H([0-9]+)$')::int AS slot_position
-      FROM bins b WHERE b.rack_level_id = $1 AND b.depth_position = $2 ORDER BY b.code FOR UPDATE
+      FROM bins b WHERE b.rack_level_id = $1 ORDER BY b.depth_position, slot_position FOR UPDATE
     `, [anchor.rack_level_id, anchor.depth_position]);
-  const targetPositions = Array.from({ length: widthUnits }, (_value, index) => anchor.slot_position + index);
-  const targetSlots = targetPositions.map((position) => slots.rows.find((slot) => slot.slot_position === position));
-  if (targetSlots.some((slot) => !slot))
+  if (anchor.slot_position + requestedWidthUnits - 1 > anchor.slots_per_level)
     throw Object.assign(new Error('No hay suficientes huecos contiguos a la derecha para ese tamaño'), { status: 400 });
+  if (anchor.depth_position + requestedDepthUnits - 1 > anchor.rack_depth_slots)
+    throw Object.assign(new Error('No hay suficientes filas libres hacia el fondo para ese tamaño'), { status: 400 });
+  const targetSlots = Array.from({ length: requestedDepthUnits }, (_depth, depthIndex) =>
+    Array.from({ length: requestedWidthUnits }, (_width, slotIndex) =>
+      slots.rows.find((slot) =>
+        slot.depth_position === anchor.depth_position + depthIndex &&
+        slot.slot_position === anchor.slot_position + slotIndex
+      )
+    )
+  ).flat();
+  if (targetSlots.some((slot) => !slot))
+    throw Object.assign(new Error('No hay suficientes huecos contiguos en la superficie solicitada'), { status: 400 });
   const resolvedSlots = targetSlots as { id: string; width_units: number; depth_position: number; merged_into_bin_id: string | null; status: string; slot_position: number }[];
   if (resolvedSlots.some((slot) => slot.merged_into_bin_id && slot.merged_into_bin_id !== anchor.id))
     throw Object.assign(new Error('El tamaño solicitado se solapa con otra caja grande'), { status: 409 });
@@ -1516,29 +1530,32 @@ async function setBinWidth(client: pg.PoolClient, binId: string, warehouseId: st
     throw Object.assign(new Error('Quita primero el contenido esperado de las ubicaciones afectadas'), { status: 409 });
 
   await client.query(
-    'UPDATE bins SET merged_into_bin_id = NULL, width_units = 1 WHERE merged_into_bin_id = $1',
+    'UPDATE bins SET merged_into_bin_id = NULL, width_units = 1, depth_units = 1 WHERE merged_into_bin_id = $1',
     [anchor.id]
   );
   const childIds = resolvedSlots.filter((slot) => slot.id !== anchor.id).map((slot) => slot.id);
   if (childIds.length)
     await client.query('UPDATE bins SET merged_into_bin_id = $1 WHERE id = ANY($2::uuid[])', [anchor.id, childIds]);
   const moduleWidth = rackBinModuleWidth(Number(anchor.rack_map_width), Number(anchor.slots_per_level));
-  const mapWidth = moduleWidth * widthUnits + 6 * (widthUnits - 1);
-  await client.query('UPDATE bins SET width_units = $1, map_width = $2 WHERE id = $3', [widthUnits, mapWidth, anchor.id]);
+  const mapWidth = moduleWidth * requestedWidthUnits + 6 * (requestedWidthUnits - 1);
+  await client.query(
+    'UPDATE bins SET width_units = $1, depth_units = $2, map_width = $3 WHERE id = $4',
+    [requestedWidthUnits, requestedDepthUnits, mapWidth, anchor.id]
+  );
 }
 
 app.put('/api/locations/:id/width', requireAdmin, async (req, res, next) => {
   const parsedId = z.string().uuid().safeParse(req.params.id);
   const parsed = binWidthSchema.safeParse(req.body);
   if (!parsedId.success) return res.status(400).json({ error: 'Identificador de ubicación no válido' });
-  if (!parsed.success) return res.status(400).json({ error: 'Tamaño de caja no válido. Elige entre 1 y 12 huecos contiguos.' });
+  if (!parsed.success) return res.status(400).json({ error: 'Tamaño de caja no válido. Elige entre 1 y 12 huecos de ancho y fondo.' });
   const warehouseId = res.locals.warehouseId as string;
   const client = await pool.connect();
   try {
     await client.query('BEGIN');
-    await setBinWidth(client, parsedId.data, warehouseId, parsed.data.widthUnits);
+    await setBinWidth(client, parsedId.data, warehouseId, parsed.data.widthUnits, parsed.data.depthUnits);
     await client.query('COMMIT');
-    res.json({ saved: true, widthUnits: parsed.data.widthUnits });
+    res.json({ saved: true, widthUnits: parsed.data.widthUnits, depthUnits: parsed.data.depthUnits });
   } catch (error) {
     await client.query('ROLLBACK');
     next(error);
@@ -2103,6 +2120,7 @@ const movementSchema = z.object({
   toBinId: z.string().uuid().optional(),
   binName: z.string().trim().min(1).max(100).optional(),
   binWidthUnits: z.coerce.number().int().min(1).max(12).optional(),
+  binDepthUnits: z.coerce.number().int().min(1).max(12).optional(),
   destinationWarehouseId: z.string().uuid().optional(),
   reference: z.string().trim().max(120).optional()
 }).superRefine((data, ctx) => {
@@ -2132,6 +2150,8 @@ const movementSchema = z.object({
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['binName'], message: 'El nombre de la caja requiere una ubicación de destino' });
   if (data.binWidthUnits !== undefined && !data.toBinId)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['binWidthUnits'], message: 'El tamaño de caja requiere una ubicación de destino' });
+  if (data.binDepthUnits !== undefined && !data.toBinId)
+    ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['binDepthUnits'], message: 'El fondo de caja requiere una ubicación de destino' });
   if (data.expiresAt && !data.lotCode)
     ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['lotCode'], message: 'Indica el código de lote para guardar su caducidad' });
   if (data.fromBinId && data.fromBinId === data.toBinId)
@@ -2220,7 +2240,7 @@ app.post('/api/movements', async (req, res, next) => {
       JOIN racks r ON r.id = rl.rack_id JOIN aisles a ON a.id = r.aisle_id
       JOIN zones z ON z.id = a.zone_id
       WHERE b.id = ANY($1::uuid[])
-      ${destinationBin || input.type === 'in_use' || input.binName || input.binWidthUnits !== undefined ? 'FOR UPDATE OF b' : 'FOR SHARE OF b'}
+      ${destinationBin || input.type === 'in_use' || input.binName || input.binWidthUnits !== undefined || input.binDepthUnits !== undefined ? 'FOR UPDATE OF b' : 'FOR SHARE OF b'}
     `, [requestedBins]) : { rows: [] as { id: string; warehouse_id: string; status: string }[], rowCount: 0 };
     const binById = new Map(binWarehouses.rows.map((bin) => [bin.id, bin]));
     if (requestedBins.some((id) => binById.get(id)?.merged_into_bin_id))
@@ -2245,8 +2265,8 @@ app.post('/api/movements', async (req, res, next) => {
           throw Object.assign(new Error('Esta ubicación está reservada por un artículo En uso'), { status: 409 });
       }
     }
-    if (input.binWidthUnits !== undefined && destinationBin)
-      await setBinWidth(client, destinationBin, destinationWarehouseId, input.binWidthUnits);
+    if ((input.binWidthUnits !== undefined || input.binDepthUnits !== undefined) && destinationBin)
+      await setBinWidth(client, destinationBin, destinationWarehouseId, input.binWidthUnits, input.binDepthUnits);
     if (input.binName && destinationBin) {
       const destinationStock = await client.query(
         'SELECT id FROM stock_balances WHERE bin_id = $1 AND quantity > 0 FOR UPDATE',
@@ -3341,6 +3361,10 @@ async function start() {
     ));
     await pool.query(readFileSync(
       resolve(apiRoot, 'src/db/migrations/013-location-code-format.sql'),
+      'utf8'
+    ));
+    await pool.query(readFileSync(
+      resolve(apiRoot, 'src/db/migrations/014-depth-wide-bins.sql'),
       'utf8'
     ));
     await pool.query(`
