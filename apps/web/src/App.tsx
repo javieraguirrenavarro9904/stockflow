@@ -265,6 +265,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
   const [salesOrders, setSalesOrders] = useState<SalesOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
+  const [productError, setProductError] = useState('');
   const [movementError, setMovementError] = useState('');
   const [movementSaving, setMovementSaving] = useState(false);
   const [search, setSearch] = useState('');
@@ -471,6 +472,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
 
   const saveProduct = async (event: FormEvent<HTMLFormElement>, product?: Product) => {
     event.preventDefault();
+    setProductError('');
     const form = new FormData(event.currentTarget);
     try {
       await request(product ? `/products/${product.id}` : '/products', {
@@ -483,11 +485,12 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
       });
       setModal(null);
       setEditingProduct(null);
+      setProductError('');
       setMovementDefaults(null);
       await refresh();
       notify(product ? 'Producto actualizado' : 'Producto añadido al catálogo');
     } catch (reason) {
-      setError(reason instanceof Error ? reason.message : 'No se pudo crear el producto');
+      setProductError(reason instanceof Error ? reason.message : 'No se pudo guardar el producto');
     }
   };
 
@@ -820,7 +823,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
           {error && <div className="error-banner"><CircleHelp size={17} /><span>{error}. Comprueba que la API y PostgreSQL estén en ejecución.</span><button onClick={() => void refresh()}>Reintentar</button></div>}
           {loading && <div className="loading-line"><span /> Conectando con el almacén…</div>}
           {page === 'overview' && <OverviewPage overview={overview} movements={movements} onNavigate={navigateToPage} />}
-          {page === 'inventory' && <InventoryPage products={visibleProducts} locations={locations} search={search} isAdmin={isAdmin} onAdd={() => { setEditingProduct(null); setModal('product'); }} onBulkReceipt={() => { setMovementError(''); setModal('bulkReceipt'); }} onEdit={(product) => { setEditingProduct(product); setModal('editProduct'); }} onMovement={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onDelete={async (id) => {
+          {page === 'inventory' && <InventoryPage products={visibleProducts} locations={locations} search={search} isAdmin={isAdmin} onAdd={() => { setEditingProduct(null); setProductError(''); setModal('product'); }} onBulkReceipt={() => { setMovementError(''); setModal('bulkReceipt'); }} onEdit={(product) => { setEditingProduct(product); setProductError(''); setModal('editProduct'); }} onMovement={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onDelete={async (id) => {
             if (!window.confirm('¿Archivar este producto? No aparecerá en el catálogo activo.')) return;
             try { await request(`/products/${id}`, { method: 'DELETE' }); await refresh(); notify('Producto archivado'); }
             catch (reason) { setError(reason instanceof Error ? reason.message : 'No se pudo archivar'); }
@@ -833,9 +836,9 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
           {page === 'settings' && <SettingsPage user={user} users={users} categories={categories} suppliers={suppliers} employeeMovementAlerts={employeeMovementAlerts} unreadEmployeeMovementAlerts={unreadEmployeeMovementAlerts} isAdmin={isAdmin} onAddUser={() => setModal('employee')} onToggleUser={(entry) => void toggleEmployee(entry)} onChangePassword={changePassword} onCreateCatalogEntry={createCatalogEntry} onDeleteCatalogEntry={deleteCatalogEntry} onMarkEmployeeAlertsRead={() => void markEmployeeAlertsRead()} />}
         </div>
       </main>
-      {modal && <Modal wide={modal === 'movement' || modal === 'bulkReceipt'} error={modal === 'movement' || modal === 'bulkReceipt' ? movementError : ''} title={modal === 'product' ? 'Añadir producto' : modal === 'editProduct' ? 'Editar producto' : modal === 'employee' ? 'Crear cuenta de empleado' : modal === 'warehouse' ? 'Añadir almacén' : modal === 'bulkReceipt' ? 'Entrada masiva desde CSV' : 'Registrar movimiento'} onClose={() => { setModal(null); setEditingProduct(null); setMovementDefaults(null); setMovementError(''); }}>
+      {modal && <Modal wide={modal === 'movement' || modal === 'bulkReceipt'} error={modal === 'movement' || modal === 'bulkReceipt' ? movementError : modal === 'product' || modal === 'editProduct' ? productError : ''} title={modal === 'product' ? 'Añadir producto' : modal === 'editProduct' ? 'Editar producto' : modal === 'employee' ? 'Crear cuenta de empleado' : modal === 'warehouse' ? 'Añadir almacén' : modal === 'bulkReceipt' ? 'Entrada masiva desde CSV' : 'Registrar movimiento'} onClose={() => { setModal(null); setEditingProduct(null); setProductError(''); setMovementDefaults(null); setMovementError(''); }}>
         {(modal === 'product' || modal === 'editProduct')
-          ? <ProductForm initial={editingProduct} categories={categories} suppliers={suppliers} onSubmit={(event) => void saveProduct(event, editingProduct ?? undefined)} onCancel={() => { setModal(null); setEditingProduct(null); }} />
+          ? <ProductForm initial={editingProduct} categories={categories} suppliers={suppliers} onSubmit={(event) => void saveProduct(event, editingProduct ?? undefined)} onCancel={() => { setModal(null); setEditingProduct(null); setProductError(''); }} />
           : modal === 'employee'
             ? <EmployeeForm onSubmit={saveEmployee} onCancel={() => setModal(null)} />
         : modal === 'warehouse'
