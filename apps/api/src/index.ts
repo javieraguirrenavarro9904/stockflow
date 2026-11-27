@@ -2258,7 +2258,7 @@ app.post('/api/movements', async (req, res, next) => {
           throw Object.assign(new Error('Esta ubicación está reservada por un artículo En uso'), { status: 409 });
       }
     }
-    if ((input.binWidthUnits !== undefined || input.binDepthUnits !== undefined) && destinationBin)
+    if (input.type !== 'return' && (input.binWidthUnits !== undefined || input.binDepthUnits !== undefined) && destinationBin)
       await setBinWidth(client, destinationBin, destinationWarehouseId, input.binWidthUnits, input.binDepthUnits);
     const decreasesStock = Boolean(sourceBin);
     let allocations: {

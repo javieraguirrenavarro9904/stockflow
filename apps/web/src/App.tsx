@@ -549,8 +549,8 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
       type, productId: type === 'return' ? undefined : form.get('productId'), quantity: Number(form.get('quantity')),
       loanId: type === 'return' ? form.get('loanId') : undefined,
       lotCode: lotCode || undefined, expiresAt: expiresAt || undefined,
-      binWidthUnits: form.get('binWidthUnits') ? Number(form.get('binWidthUnits')) : undefined,
-      binDepthUnits: form.get('binDepthUnits') ? Number(form.get('binDepthUnits')) : undefined,
+      binWidthUnits: type !== 'return' && form.get('binWidthUnits') ? Number(form.get('binWidthUnits')) : undefined,
+      binDepthUnits: type !== 'return' && form.get('binDepthUnits') ? Number(form.get('binDepthUnits')) : undefined,
       reference: form.get('reference') || undefined,
       destinationWarehouseId: type === 'transfer' ? form.get('destinationWarehouseId') : undefined
     };
@@ -2585,7 +2585,7 @@ function MovementForm({ products, locations, racks, warehouses, inUseLoans, curr
         {toBinId && <div><span>Destino</span><strong>{selectedDestination ? locationLabel(selectedDestination) : toBinId}</strong></div>}
       </div>
       <label>Cantidad<input required name="quantity" type="number" min="0.01" max={type === 'return' ? selectedLoan?.remaining_quantity : undefined} step="0.01" placeholder={type === 'return' ? String(selectedLoan?.remaining_quantity ?? '0') : '0'} defaultValue={type === 'return' ? selectedLoan?.remaining_quantity : undefined} autoFocus /></label>
-        {toBinId && selectedDestination && isEmpty(selectedDestination) && <>
+        {type !== 'return' && toBinId && selectedDestination && isEmpty(selectedDestination) && <>
           <label>Tamaño de la caja<select name="binWidthUnits" defaultValue={selectedDestination.width_units}>
             {Array.from({ length: Math.min(12, (destinationRacks.find((rack) => rack.id === selectedDestination.rack_id)?.bins_per_level ?? 1) - selectedDestination.slot_position + 1) }, (_value, index) => index + 1).map((units) => <option key={units} value={units}>{units} {units === 1 ? 'hueco' : 'huecos'} seguidos</option>)}
           </select><small className="field-help">Huecos contiguos hacia la derecha.</small></label>
