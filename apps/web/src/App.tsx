@@ -76,6 +76,31 @@ type Overview = {
   expiring: { name: string; lot_code: string; expires_at: string; quantity: number }[];
 };
 type Page = 'overview' | 'inventory' | 'map' | 'movements' | 'purchasing' | 'salesOrders' | 'assistant' | 'settings';
+type EmployeePanelSection = Exclude<Page, 'overview' | 'settings'>;
+type EmployeeMovementType = 'receipt' | 'dispatch' | 'transfer' | 'adjustment' | 'in_use' | 'return';
+type EmployeePanelConfig = {
+  sections: Record<EmployeePanelSection, boolean>;
+  movementTypes: Record<EmployeeMovementType, boolean>;
+};
+
+const defaultEmployeePanelConfig: EmployeePanelConfig = {
+  sections: {
+    inventory: true,
+    map: true,
+    movements: true,
+    purchasing: true,
+    salesOrders: true,
+    assistant: true
+  },
+  movementTypes: {
+    receipt: false,
+    dispatch: false,
+    transfer: false,
+    adjustment: false,
+    in_use: true,
+    return: true
+  }
+};
 
 const navItems: { id: Page; label: string; icon: typeof LayoutDashboard }[] = [
   { id: 'overview', label: 'Resumen', icon: LayoutDashboard },
@@ -90,6 +115,20 @@ const movementNames: Record<string, string> = {
   receipt: 'Entrada', dispatch: 'Salida', transfer: 'Transferencia', adjustment: 'Ajuste',
   in_use: 'En uso', return: 'Devolución'
 };
+const employeePanelSectionNames: Record<EmployeePanelSection, string> = {
+  inventory: 'Inventario',
+  map: 'Mapa del almacén',
+  movements: 'Movimientos',
+  purchasing: 'Compras',
+  salesOrders: 'Pedidos de salida',
+  assistant: 'Asistente IA'
+};
+const employeePanelSections: EmployeePanelSection[] = ['inventory', 'map', 'movements', 'purchasing', 'salesOrders', 'assistant'];
+const employeeMovementTypes: EmployeeMovementType[] = ['receipt', 'dispatch', 'transfer', 'adjustment', 'in_use', 'return'];
+
+function canEmployeeAccessPage(page: Page, config: EmployeePanelConfig) {
+  return page === 'overview' || page === 'settings' || config.sections[page];
+}
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   if (!API) throw new Error('Falta configurar VITE_API_URL con la dirección pública de la API');
@@ -268,6 +307,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
   const [productError, setProductError] = useState('');
   const [movementError, setMovementError] = useState('');
   const [movementSaving, setMovementSaving] = useState(false);
+  const [employeePanelConfig, setEmployeePanelConfig] = useState(defaultEmployeePanelConfig);
   const [search, setSearch] = useState('');
   const [selectedLocation, setSelectedLocation] = useState<Location | null>(null);
   const [modal, setModal] = useState<'product' | 'editProduct' | 'movement' | 'bulkReceipt' | 'employee' | 'warehouse' | null>(null);
@@ -292,7 +332,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
       localStorage.setItem('stockflow.warehouse', selectedWarehouse.id);
       setWarehouses(warehouseList);
       setSelectedWarehouseId(selectedWarehouse.id);
-      const [summary, stock, bins, history, catalog, rackList, mapLayout, reorderList, purchaseOrderList, salesOrderList, loanList] = await Promise.all([
+      const [summary, stock, bins, history, catalog, rackList, mapLayout, reorderList, purchaseOrderList, salesOrderList, loanList, panelConfig] = await Promise.all([
         request<Overview>('/overview'),
         request<Product[]>('/products'),
         request<Location[]>('/locations'),
@@ -303,7 +343,8 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
         request<ReplenishmentItem[]>('/replenishment'),
         request<PurchaseOrder[]>('/purchase-orders'),
         request<SalesOrder[]>('/sales-orders'),
-        request<InUseLoan[]>('/in-use')
+        request<InUseLoan[]>('/in-use'),
+        request<EmployeePanelConfig>('/employee-panel-config')
       ]);
       setOverview(summary);
       setProducts(stock);
@@ -319,6 +360,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
       setPurchaseOrders(purchaseOrderList);
       setSalesOrders(salesOrderList);
       setInUseLoans(loanList);
+      setEmployeePanelConfig(panelConfig);
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : 'No se pudo cargar el almacén');
     } finally {
@@ -327,6 +369,9 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
   }, []);
 
   useEffect(() => { void refresh(); }, [refresh]);
+  useEffect(() => {
+    if (!isAdmin && !canEmployeeAccessPage(page, employeePanelConfig)) setPage('overview');
+  }, [employeePanelConfig, isAdmin, page]);
 
   useEffect(() => {
     if (!isAdmin) return;
@@ -457,6 +502,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
   };
 
   const navigateToPage = (nextPage: Page) => {
+    if (!isAdmin && !canEmployeeAccessPage(nextPage, employeePanelConfig)) return;
     if (mapEditing && nextPage !== 'map') {
       if (!window.confirm('El plano sigue en modo edición. ¿Descartar los cambios y salir?')) return;
       setMapEditing(false);
@@ -574,6 +620,21 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
       setMovementError(reason instanceof Error ? reason.message : 'No se pudo registrar el movimiento');
     } finally {
       setMovementSaving(false);
+    }
+  };
+
+  const saveEmployeePanel = async (config: EmployeePanelConfig) => {
+    try {
+      const saved = await request<EmployeePanelConfig>('/admin/employee-panel-config', {
+        method: 'PUT',
+        body: JSON.stringify(config)
+      });
+      setEmployeePanelConfig(saved);
+      notify('Panel de empleados actualizado');
+      return true;
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'No se pudo guardar el panel de empleados');
+      return false;
     }
   };
 
@@ -758,7 +819,15 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
   };
 
   const pageTitle = page === 'settings' ? 'Configuración' : navItems.find((item) => item.id === page)?.label ?? 'Resumen';
-  const operationalAlertCount = (overview?.lowStock.length ?? 0) + (overview?.expiring.length ?? 0);
+  const canCreateMovement = isAdmin || (
+    employeePanelConfig.sections.movements &&
+    employeeMovementTypes.some((type) => employeePanelConfig.movementTypes[type])
+  );
+  const canMoveStockFromMap = isAdmin || (
+    employeePanelConfig.sections.movements && employeePanelConfig.movementTypes.in_use
+  );
+  const canSeeInventory = isAdmin || employeePanelConfig.sections.inventory;
+  const operationalAlertCount = canSeeInventory ? (overview?.lowStock.length ?? 0) + (overview?.expiring.length ?? 0) : 0;
   const notificationCount = operationalAlertCount + (isAdmin ? unreadEmployeeMovementAlerts : 0);
   return (
     <div className={`app-shell ${sidebarCollapsed ? 'sidebar-collapsed' : ''}`}>
@@ -776,10 +845,10 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
             void refresh();
           }}><Building2 size={14} /><span className="warehouse-option-name">{warehouse.name}</span><small>{warehouse.code}</small></button>
           {isAdmin && warehouses.length > 1 && <button className="warehouse-delete" title={`Eliminar ${warehouse.name}`} aria-label={`Eliminar almacén ${warehouse.name}`} onClick={() => void deleteWarehouse(warehouse)}><Trash2 size={14} /></button>}
-        </div>)}{isAdmin && <button className="warehouse-add" onClick={() => { setWarehouseOpen(false); setModal('warehouse'); }}><Plus size={14} /> Añadir almacén</button>}<button onClick={() => { setWarehouseOpen(false); navigateToPage('map'); }}>Abrir mapa <ChevronRight size={13} /></button></div>}
+        </div>)}{isAdmin && <button className="warehouse-add" onClick={() => { setWarehouseOpen(false); setModal('warehouse'); }}><Plus size={14} /> Añadir almacén</button>}{(isAdmin || employeePanelConfig.sections.map) && <button onClick={() => { setWarehouseOpen(false); navigateToPage('map'); }}>Abrir mapa <ChevronRight size={13} /></button>}</div>}
         <div className="nav-heading">OPERACIONES</div>
         <nav className="nav-list">
-          {navItems.map(({ id, label, icon: Icon }) => (
+          {navItems.filter(({ id }) => isAdmin || canEmployeeAccessPage(id, employeePanelConfig)).map(({ id, label, icon: Icon }) => (
             <button key={id} className={`nav-item ${page === id ? 'selected' : ''}`} onClick={() => navigateToPage(id)}>
               <Icon size={18} strokeWidth={1.8} /><span>{label}</span>
               {id === 'inventory' && overview?.stats.low_stock ? <span className="nav-count">{overview.stats.low_stock}</span> : null}
@@ -805,11 +874,11 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
             <div className="breadcrumbs"><span>Almacén</span><ChevronRight size={14} /><strong>{pageTitle}</strong></div>
           </div>
           <div className="top-actions">
-            <label className="global-search"><Search size={16} /><input ref={searchInputRef} value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar SKU, producto..." /><kbd><Command size={11} /> K</kbd></label>
+            {(isAdmin || employeePanelConfig.sections.inventory) && <label className="global-search"><Search size={16} /><input ref={searchInputRef} value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Buscar SKU, producto..." /><kbd><Command size={11} /> K</kbd></label>}
             <div className="notification-wrap"><button className="icon-button notification-button" aria-label="Notificaciones" aria-expanded={notificationsOpen} onClick={() => setNotificationsOpen((open) => !open)}><Bell size={18} />{notificationCount > 0 && <i />}</button>
               {notificationsOpen && <div className="notification-popover"><div className="notification-title"><strong>Notificaciones</strong><span>{notificationCount}</span></div>
-                {(overview?.lowStock ?? []).slice(0, 3).map((product) => <button key={product.id} className="notification-item" onClick={() => { setNotificationsOpen(false); navigateToPage('inventory'); }}><span className="notification-alert" /><span><strong>Stock bajo</strong><small>{product.name} · {formatNumber(product.stock)} uds.</small></span><ChevronRight size={14} /></button>)}
-                {(overview?.expiring ?? []).slice(0, 3).map((lot) => <button key={lot.lot_code} className="notification-item" onClick={() => { setNotificationsOpen(false); navigateToPage('inventory'); }}><span className="notification-alert expiry" /><span><strong>Caducidad próxima</strong><small>{lot.name} · {new Date(lot.expires_at).toLocaleDateString('es-ES')}</small></span><ChevronRight size={14} /></button>)}
+                {canSeeInventory && (overview?.lowStock ?? []).slice(0, 3).map((product) => <button key={product.id} className="notification-item" onClick={() => { setNotificationsOpen(false); navigateToPage('inventory'); }}><span className="notification-alert" /><span><strong>Stock bajo</strong><small>{product.name} · {formatNumber(product.stock)} uds.</small></span><ChevronRight size={14} /></button>)}
+                {canSeeInventory && (overview?.expiring ?? []).slice(0, 3).map((lot) => <button key={lot.lot_code} className="notification-item" onClick={() => { setNotificationsOpen(false); navigateToPage('inventory'); }}><span className="notification-alert expiry" /><span><strong>Caducidad próxima</strong><small>{lot.name} · {new Date(lot.expires_at).toLocaleDateString('es-ES')}</small></span><ChevronRight size={14} /></button>)}
                 {isAdmin && employeeMovementAlerts.filter((alert) => alert.unread).slice(0, 3).map((alert) => <button key={alert.id} className="notification-item" onClick={() => { setNotificationsOpen(false); navigateToPage('settings'); }}><span className="notification-alert movement" /><span><strong>{movementNames[alert.type] ?? alert.type} · {alert.user_name}</strong><small>{alert.products} · {formatDate(alert.created_at)}</small></span><ChevronRight size={14} /></button>)}
                 {!notificationCount && <div className="notification-empty"><ShieldCheck size={17} /> No tienes alertas pendientes</div>}
                 {isAdmin && <button className="notification-view-all" onClick={() => { setNotificationsOpen(false); navigateToPage('settings'); }}>Ver alertas de movimientos <ChevronRight size={13} /></button>}
@@ -822,18 +891,18 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
         <div className="page-content">
           {error && <div className="error-banner"><CircleHelp size={17} /><span>{error}. Comprueba que la API y PostgreSQL estén en ejecución.</span><button onClick={() => void refresh()}>Reintentar</button></div>}
           {loading && <div className="loading-line"><span /> Conectando con el almacén…</div>}
-          {page === 'overview' && <OverviewPage overview={overview} movements={movements} onNavigate={navigateToPage} />}
-          {page === 'inventory' && <InventoryPage products={visibleProducts} locations={locations} search={search} isAdmin={isAdmin} onAdd={() => { setEditingProduct(null); setProductError(''); setModal('product'); }} onBulkReceipt={() => { setMovementError(''); setModal('bulkReceipt'); }} onEdit={(product) => { setEditingProduct(product); setProductError(''); setModal('editProduct'); }} onMovement={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onDelete={async (id) => {
+          {page === 'overview' && <OverviewPage overview={overview} movements={movements} sections={employeePanelConfig.sections} canCreateMovement={canCreateMovement} onNavigate={navigateToPage} />}
+          {page === 'inventory' && <InventoryPage products={visibleProducts} locations={locations} search={search} isAdmin={isAdmin} canCreateMovement={canCreateMovement} onAdd={() => { setEditingProduct(null); setProductError(''); setModal('product'); }} onBulkReceipt={() => { setMovementError(''); setModal('bulkReceipt'); }} onEdit={(product) => { setEditingProduct(product); setProductError(''); setModal('editProduct'); }} onMovement={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onDelete={async (id) => {
             if (!window.confirm('¿Archivar este producto? No aparecerá en el catálogo activo.')) return;
             try { await request(`/products/${id}`, { method: 'DELETE' }); await refresh(); notify('Producto archivado'); }
             catch (reason) { setError(reason instanceof Error ? reason.message : 'No se pudo archivar'); }
           }} />}
-          {page === 'map' && warehouseMap && <MapPage products={products} locations={locations} racks={racks} warehouse={warehouseMap} aisles={aisles} selected={selectedLocation} initialRackId={qrRackId} isAdmin={isAdmin} onSelect={setSelectedLocation} onRefresh={refresh} onNotify={notify} onMoveStock={(location) => { setMovementDefaults({ type: isAdmin ? 'transfer' : 'in_use', fromBinId: location.id }); setMovementError(''); setModal('movement'); }} onSaveExpected={saveExpectedContent} onEditingChange={setMapEditing} />}
-          {page === 'movements' && <MovementsPage movements={movements} onAdd={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onExport={() => downloadCsv('movimientos.csv', [['Tipo', 'Referencia', 'Productos', 'Unidades', 'Fecha'], ...movements.map((item) => [movementNames[item.type] ?? item.type, item.reference, item.products, item.units, item.created_at])])} />}
+          {page === 'map' && warehouseMap && <MapPage products={products} locations={locations} racks={racks} warehouse={warehouseMap} aisles={aisles} selected={selectedLocation} initialRackId={qrRackId} isAdmin={isAdmin} canMoveStock={canMoveStockFromMap} onSelect={setSelectedLocation} onRefresh={refresh} onNotify={notify} onMoveStock={(location) => { setMovementDefaults({ type: isAdmin ? 'transfer' : 'in_use', fromBinId: location.id }); setMovementError(''); setModal('movement'); }} onSaveExpected={saveExpectedContent} onEditingChange={setMapEditing} />}
+          {page === 'movements' && <MovementsPage movements={movements} canCreateMovement={canCreateMovement} onAdd={() => { setMovementDefaults(null); setMovementError(''); setModal('movement'); }} onExport={() => downloadCsv('movimientos.csv', [['Tipo', 'Referencia', 'Productos', 'Unidades', 'Fecha'], ...movements.map((item) => [movementNames[item.type] ?? item.type, item.reference, item.products, item.units, item.created_at])])} />}
           {page === 'purchasing' && <PurchasingPage suggestions={replenishment} orders={purchaseOrders} locations={locations} isAdmin={isAdmin} onCreateOrder={createPurchaseOrders} onReceiveOrder={receivePurchaseOrder} onCancelOrder={cancelPurchaseOrder} />}
           {page === 'salesOrders' && <SalesOrdersPage orders={salesOrders} products={products} locations={locations} isAdmin={isAdmin} onCreateOrder={createSalesOrder} onStartPicking={(id) => changeSalesOrder(id, 'picking')} onFulfill={(id) => changeSalesOrder(id, 'fulfill')} onCancelOrder={(id) => changeSalesOrder(id, 'cancel')} />}
           {page === 'assistant' && <AssistantPage />}
-          {page === 'settings' && <SettingsPage user={user} users={users} categories={categories} suppliers={suppliers} employeeMovementAlerts={employeeMovementAlerts} unreadEmployeeMovementAlerts={unreadEmployeeMovementAlerts} isAdmin={isAdmin} onAddUser={() => setModal('employee')} onToggleUser={(entry) => void toggleEmployee(entry)} onChangePassword={changePassword} onCreateCatalogEntry={createCatalogEntry} onDeleteCatalogEntry={deleteCatalogEntry} onMarkEmployeeAlertsRead={() => void markEmployeeAlertsRead()} />}
+          {page === 'settings' && <SettingsPage user={user} users={users} categories={categories} suppliers={suppliers} employeeMovementAlerts={employeeMovementAlerts} unreadEmployeeMovementAlerts={unreadEmployeeMovementAlerts} isAdmin={isAdmin} employeePanelConfig={employeePanelConfig} onSaveEmployeePanel={saveEmployeePanel} onAddUser={() => setModal('employee')} onToggleUser={(entry) => void toggleEmployee(entry)} onChangePassword={changePassword} onCreateCatalogEntry={createCatalogEntry} onDeleteCatalogEntry={deleteCatalogEntry} onMarkEmployeeAlertsRead={() => void markEmployeeAlertsRead()} />}
         </div>
       </main>
       {modal && <Modal wide={modal === 'movement' || modal === 'bulkReceipt'} error={modal === 'movement' || modal === 'bulkReceipt' ? movementError : modal === 'product' || modal === 'editProduct' ? productError : ''} title={modal === 'product' ? 'Añadir producto' : modal === 'editProduct' ? 'Editar producto' : modal === 'employee' ? 'Crear cuenta de empleado' : modal === 'warehouse' ? 'Añadir almacén' : modal === 'bulkReceipt' ? 'Entrada masiva desde CSV' : 'Registrar movimiento'} onClose={() => { setModal(null); setEditingProduct(null); setProductError(''); setMovementDefaults(null); setMovementError(''); }}>
@@ -845,7 +914,7 @@ function WmsApp({ user, onSignOut }: { user: AuthUser; onSignOut: () => void }) 
           ? <WarehouseForm onSubmit={saveWarehouse} onCancel={() => setModal(null)} />
         : modal === 'bulkReceipt'
           ? <BulkReceiptForm products={products} locations={locations} saving={movementSaving} onSubmit={(reference, lines) => void saveBulkReceipt(reference, lines)} onCancel={() => setModal(null)} />
-          : <MovementForm key={`${movementDefaults?.type ?? 'receipt'}-${movementDefaults?.fromBinId ?? 'new'}`} products={products} locations={locations} racks={racks} warehouses={warehouses} inUseLoans={inUseLoans} currentWarehouseId={selectedWarehouseId ?? ''} isAdmin={isAdmin} initialType={movementDefaults?.type} initialFromBinId={movementDefaults?.fromBinId} saving={movementSaving} onSubmit={saveMovement} onCancel={() => { setModal(null); setMovementDefaults(null); setMovementError(''); }} />}
+          : <MovementForm key={`${movementDefaults?.type ?? 'receipt'}-${movementDefaults?.fromBinId ?? 'new'}`} products={products} locations={locations} racks={racks} warehouses={warehouses} inUseLoans={inUseLoans} currentWarehouseId={selectedWarehouseId ?? ''} isAdmin={isAdmin} enabledMovementTypes={employeePanelConfig.movementTypes} initialType={movementDefaults?.type} initialFromBinId={movementDefaults?.fromBinId} saving={movementSaving} onSubmit={saveMovement} onCancel={() => { setModal(null); setMovementDefaults(null); setMovementError(''); }} />}
       </Modal>}
       {toast && <div className="toast"><Check size={17} />{toast}</div>}
     </div>
@@ -903,14 +972,16 @@ function LoginPage({ onLogin, onRegister }: {
   </section></main>;
 }
 
-function SettingsPage({ user, users, categories, suppliers, employeeMovementAlerts, unreadEmployeeMovementAlerts, isAdmin, onAddUser, onToggleUser, onChangePassword, onCreateCatalogEntry, onDeleteCatalogEntry, onMarkEmployeeAlertsRead }: {
+function SettingsPage({ user, users, categories, suppliers, employeeMovementAlerts, unreadEmployeeMovementAlerts, isAdmin, employeePanelConfig, onSaveEmployeePanel, onAddUser, onToggleUser, onChangePassword, onCreateCatalogEntry, onDeleteCatalogEntry, onMarkEmployeeAlertsRead }: {
   user: AuthUser; users: UserEntry[]; categories: CatalogOption[]; suppliers: CatalogOption[]; isAdmin: boolean; onAddUser: () => void;
+  employeePanelConfig: EmployeePanelConfig; onSaveEmployeePanel: (config: EmployeePanelConfig) => Promise<boolean>;
   employeeMovementAlerts: EmployeeMovementAlert[]; unreadEmployeeMovementAlerts: number;
   onToggleUser: (user: UserEntry) => void; onChangePassword: (event: FormEvent<HTMLFormElement>) => void;
   onCreateCatalogEntry: (kind: 'categories' | 'suppliers', name: string) => Promise<boolean>;
   onDeleteCatalogEntry: (kind: 'categories' | 'suppliers', entry: CatalogOption) => Promise<boolean>;
   onMarkEmployeeAlertsRead: () => void;
 }) {
+  const [editingEmployeePanel, setEditingEmployeePanel] = useState(false);
   return <>
     <PageIntro eyebrow="CUENTA Y PERMISOS" title="Configuración" description="Gestiona tu sesión y los accesos del equipo al almacén." />
     <div className="settings-grid">
@@ -927,11 +998,74 @@ function SettingsPage({ user, users, categories, suppliers, employeeMovementAler
           {!users.length && <div className="table-empty">Cargando usuarios…</div>}</div>
         <div className="team-footnote"><ShieldCheck size={14} /> Desactivar una cuenta cierra también las sesiones abiertas.</div>
       </section>}
+      {isAdmin && <section className="panel employee-panel-admin">
+        <div className="panel-heading"><div><h2>Panel de empleados</h2><p>Configura un único conjunto de accesos para todas las cuentas con rol de empleado.</p></div>
+          <button className="button button-secondary" aria-expanded={editingEmployeePanel} onClick={() => setEditingEmployeePanel((open) => !open)}>{editingEmployeePanel ? 'Cerrar editor' : 'Editar panel empleados'}</button>
+        </div>
+        {editingEmployeePanel && <EmployeePanelEditor config={employeePanelConfig} onSave={onSaveEmployeePanel} onCancel={() => setEditingEmployeePanel(false)} />}
+      </section>}
       {isAdmin && <EmployeeMovementAlerts alerts={employeeMovementAlerts} unreadCount={unreadEmployeeMovementAlerts} onMarkRead={onMarkEmployeeAlertsRead} />}
       {isAdmin && <CatalogManagement categories={categories} suppliers={suppliers} onCreate={onCreateCatalogEntry} onDelete={onDeleteCatalogEntry} />}
-      {!isAdmin && <section className="panel employee-permissions"><div className="settings-section-title"><Users size={16} /><strong>Permisos del empleado</strong></div><p>Puedes consultar el inventario, registrar movimientos, explorar el mapa y utilizar el asistente. La configuración de productos y estanterías está reservada a administradores.</p></section>}
+      {!isAdmin && <section className="panel employee-permissions"><div className="settings-section-title"><Users size={16} /><strong>Permisos del empleado</strong></div><p>Los accesos y movimientos disponibles en tu panel los configura el administrador para todas las cuentas de empleado. Las operaciones administrativas siguen reservadas a administradores.</p></section>}
     </div>
   </>;
+}
+
+function EmployeePanelEditor({ config, onSave, onCancel }: {
+  config: EmployeePanelConfig; onSave: (config: EmployeePanelConfig) => Promise<boolean>; onCancel: () => void;
+}) {
+  const [draft, setDraft] = useState(config);
+  const [saving, setSaving] = useState(false);
+  const updateSection = (section: EmployeePanelSection, enabled: boolean) => {
+    setDraft((current) => ({ ...current, sections: { ...current.sections, [section]: enabled } }));
+  };
+  const updateMovement = (movement: EmployeeMovementType, enabled: boolean) => {
+    setDraft((current) => ({ ...current, movementTypes: { ...current.movementTypes, [movement]: enabled } }));
+  };
+  const submit = async () => {
+    setSaving(true);
+    try {
+      if (await onSave(draft)) onCancel();
+    } finally {
+      setSaving(false);
+    }
+  };
+  const descriptions: Record<EmployeePanelSection, string> = {
+    inventory: 'Consulta de productos, existencias y ubicaciones.',
+    map: 'Consulta del plano y las estanterías.',
+    movements: 'Historial y registro de movimientos permitidos.',
+    purchasing: 'Consulta de reposición y pedidos a proveedores.',
+    salesOrders: 'Preparación y seguimiento de pedidos de salida.',
+    assistant: 'Consultas al asistente del almacén.'
+  };
+  return <div className="employee-panel-editor">
+    <div className="employee-panel-option-group">
+      <h3>Secciones visibles</h3>
+      <div className="employee-panel-switch-grid">{employeePanelSections.map((section) =>
+        <PermissionSwitch key={section} label={employeePanelSectionNames[section]} description={descriptions[section]} checked={draft.sections[section]} onChange={(enabled) => updateSection(section, enabled)} />
+      )}</div>
+    </div>
+    <div className="employee-panel-option-group">
+      <h3>Operaciones de movimientos</h3>
+      <div className="employee-panel-switch-grid">{employeeMovementTypes.map((movement) =>
+        <PermissionSwitch key={movement} label={movementNames[movement]} description={`Permite registrar movimientos de tipo «${movementNames[movement]}».`} checked={draft.movementTypes[movement]} onChange={(enabled) => updateMovement(movement, enabled)} />
+      )}</div>
+      <p className="employee-panel-note">Los permisos de movimiento se aplican también en la API. Crear productos, gestionar estanterías y otras acciones administrativas siguen reservadas al administrador.</p>
+    </div>
+    <div className="form-actions"><button type="button" className="button button-secondary" disabled={saving} onClick={onCancel}>Cancelar</button><button type="button" className="button button-primary" disabled={saving} onClick={() => void submit()}>{saving ? 'Guardando…' : <><Check size={15} /> Guardar panel común</>}</button></div>
+  </div>;
+}
+
+function PermissionSwitch({ label, description, checked, onChange }: {
+  label: string; description: string; checked: boolean; onChange: (enabled: boolean) => void;
+}) {
+  return <label className="employee-panel-switch-row">
+    <span className="employee-panel-switch-copy"><strong>{label}</strong><small>{description}</small></span>
+    <span className="employee-panel-switch-control">
+      <input type="checkbox" role="switch" checked={checked} onChange={(event) => onChange(event.target.checked)} />
+      <span className="employee-panel-switch-track" aria-hidden="true" />
+    </span>
+  </label>;
 }
 
 function EmployeeMovementAlerts({ alerts, unreadCount, onMarkRead }: {
@@ -1050,22 +1184,27 @@ function RackConfigForm({ rack, onChange, onDelete }: {
   </div>;
 }
 
-function OverviewPage({ overview, movements, onNavigate }: { overview: Overview | null; movements: Movement[]; onNavigate: (page: Page) => void }) {
+function OverviewPage({ overview, movements, sections, canCreateMovement, onNavigate }: {
+  overview: Overview | null; movements: Movement[]; sections: EmployeePanelConfig['sections'];
+  canCreateMovement: boolean; onNavigate: (page: Page) => void;
+}) {
   const stats = overview?.stats;
   return <>
-    <PageIntro eyebrow={todayLabel()} title="Buenos días, Alex 👋" description="Aquí tienes lo que está pasando hoy en tu almacén." actions={<button className="button button-primary" onClick={() => onNavigate('movements')}><Plus size={17} /> Nuevo movimiento</button>} />
-    <section className="stats-grid">
-      <StatCard label="Referencias activas" value={formatNumber(stats?.products ?? 0)} note="en catálogo" icon={<Package size={18} />} tone="green" />
-      <StatCard label="Unidades en stock" value={formatNumber(stats?.units ?? 0)} note="en todo el almacén" icon={<Boxes size={18} />} tone="blue" />
-      <StatCard label="Ubicaciones" value={formatNumber(stats?.locations ?? 0)} note="posiciones activas" icon={<Map size={18} />} tone="purple" />
-      <StatCard label="Stock bajo" value={formatNumber(stats?.low_stock ?? 0)} note="requieren atención" icon={<Activity size={18} />} tone="orange" alert={number(stats?.low_stock) > 0} />
-    </section>
-    <div className="dashboard-grid">
-      <section className="panel activity-panel">
+    <PageIntro eyebrow={todayLabel()} title="Buenos días, Alex 👋" description="Aquí tienes lo que está pasando hoy en tu almacén." actions={canCreateMovement ? <button className="button button-primary" onClick={() => onNavigate('movements')}><Plus size={17} /> Nuevo movimiento</button> : undefined} />
+    {(sections.inventory || sections.map) && <section className="stats-grid">
+      {sections.inventory && <>
+        <StatCard label="Referencias activas" value={formatNumber(stats?.products ?? 0)} note="en catálogo" icon={<Package size={18} />} tone="green" />
+        <StatCard label="Unidades en stock" value={formatNumber(stats?.units ?? 0)} note="en todo el almacén" icon={<Boxes size={18} />} tone="blue" />
+        <StatCard label="Stock bajo" value={formatNumber(stats?.low_stock ?? 0)} note="requieren atención" icon={<Activity size={18} />} tone="orange" alert={number(stats?.low_stock) > 0} />
+      </>}
+      {sections.map && <StatCard label="Ubicaciones" value={formatNumber(stats?.locations ?? 0)} note="posiciones activas" icon={<Map size={18} />} tone="purple" />}
+    </section>}
+    {(sections.movements || sections.inventory) && <div className="dashboard-grid">
+      {sections.movements && <section className="panel activity-panel">
         <div className="panel-heading"><div><h2>Actividad reciente</h2><p>Últimos movimientos registrados</p></div><button className="text-button" onClick={() => onNavigate('movements')}>Ver todo <ChevronRight size={15} /></button></div>
         <MovementTable movements={movements.slice(0, 5)} />
-      </section>
-      <section className="panel attention-panel">
+      </section>}
+      {sections.inventory && <section className="panel attention-panel">
         <div className="panel-heading"><div><h2>Necesita atención</h2><p>Prioridades de tu almacén</p></div><span className="attention-count">{(overview?.lowStock.length ?? 0) + (overview?.expiring.length ?? 0)}</span></div>
         <div className="attention-list">
           {(overview?.lowStock ?? []).slice(0, 3).map((p) => <div className="attention-row" key={p.id}><div className="attention-icon orange"><Package size={16} /></div><div className="attention-copy"><strong>Stock bajo</strong><span>{p.name}</span></div><span className="attention-value">{formatNumber(p.stock)} / {formatNumber(p.min_stock)}</span></div>)}
@@ -1073,14 +1212,14 @@ function OverviewPage({ overview, movements, onNavigate }: { overview: Overview 
           {!overview?.lowStock.length && !overview?.expiring.length && <div className="empty-inline"><ShieldCheck size={20} /> Todo bajo control. No hay alertas activas.</div>}
         </div>
         <button className="attention-link" onClick={() => onNavigate('inventory')}>Revisar inventario <ChevronRight size={15} /></button>
-      </section>
-    </div>
-    <section className="quick-actions">
+      </section>}
+    </div>}
+    {(sections.inventory || sections.map || sections.assistant) && <section className="quick-actions">
       <div><span className="eyebrow">ACCESOS RÁPIDOS</span><h2>¿Qué necesitas hacer?</h2></div>
-      <button className="quick-card" onClick={() => onNavigate('inventory')}><div className="quick-icon green"><Package size={19} /></div><span><strong>Consultar stock</strong><small>Busca productos y ubicaciones</small></span><ChevronRight size={17} /></button>
-      <button className="quick-card" onClick={() => onNavigate('map')}><div className="quick-icon blue"><Map size={19} /></div><span><strong>Ver mapa del almacén</strong><small>Explora tus ubicaciones</small></span><ChevronRight size={17} /></button>
-      <button className="quick-card" onClick={() => onNavigate('assistant')}><div className="quick-icon purple"><Sparkles size={19} /></div><span><strong>Preguntar al asistente</strong><small>Resuelve dudas en segundos</small></span><ChevronRight size={17} /></button>
-    </section>
+      {sections.inventory && <button className="quick-card" onClick={() => onNavigate('inventory')}><div className="quick-icon green"><Package size={19} /></div><span><strong>Consultar stock</strong><small>Busca productos y ubicaciones</small></span><ChevronRight size={17} /></button>}
+      {sections.map && <button className="quick-card" onClick={() => onNavigate('map')}><div className="quick-icon blue"><Map size={19} /></div><span><strong>Ver mapa del almacén</strong><small>Explora tus ubicaciones</small></span><ChevronRight size={17} /></button>}
+      {sections.assistant && <button className="quick-card" onClick={() => onNavigate('assistant')}><div className="quick-icon purple"><Sparkles size={19} /></div><span><strong>Preguntar al asistente</strong><small>Resuelve dudas en segundos</small></span><ChevronRight size={17} /></button>}
+    </section>}
   </>;
 }
 
@@ -1099,11 +1238,11 @@ function MovementTable({ movements }: { movements: Movement[] }) {
   </tbody></table></div>;
 }
 
-function InventoryPage({ products, locations, search, isAdmin, onAdd, onBulkReceipt, onEdit, onMovement, onDelete }: { products: Product[]; locations: Location[]; search: string; isAdmin: boolean; onAdd: () => void; onBulkReceipt: () => void; onEdit: (product: Product) => void; onMovement: () => void; onDelete: (id: string) => void }) {
+function InventoryPage({ products, locations, search, isAdmin, canCreateMovement, onAdd, onBulkReceipt, onEdit, onMovement, onDelete }: { products: Product[]; locations: Location[]; search: string; isAdmin: boolean; canCreateMovement: boolean; onAdd: () => void; onBulkReceipt: () => void; onEdit: (product: Product) => void; onMovement: () => void; onDelete: (id: string) => void }) {
   const [filter, setFilter] = useState('Todos');
   const filtered = products.filter((p) => filter === 'Todos' || (filter === 'Stock bajo' ? number(p.stock) - number(p.reserved) <= number(p.min_stock) : filter === 'En stock' ? number(p.stock) - number(p.reserved) > number(p.min_stock) : true));
   return <>
-    <PageIntro eyebrow="CONTROL DE EXISTENCIAS" title="Inventario" description="Consulta el catálogo propio de este almacén, sus existencias y alertas de reposición." actions={<><button className="button button-secondary" onClick={onMovement}><ArrowLeftRight size={16} /> Movimiento</button>{isAdmin && <><button className="button button-secondary" onClick={onBulkReceipt}><Upload size={15} /> Carga masiva CSV</button><button className="button button-primary" onClick={onAdd}><Plus size={17} /> Añadir producto</button></>}</>} />
+    <PageIntro eyebrow="CONTROL DE EXISTENCIAS" title="Inventario" description="Consulta el catálogo propio de este almacén, sus existencias y alertas de reposición." actions={<>{canCreateMovement && <button className="button button-secondary" onClick={onMovement}><ArrowLeftRight size={16} /> Movimiento</button>}{isAdmin && <><button className="button button-secondary" onClick={onBulkReceipt}><Upload size={15} /> Carga masiva CSV</button><button className="button button-primary" onClick={onAdd}><Plus size={17} /> Añadir producto</button></>}</>} />
     <section className="panel inventory-panel">
       <div className="inventory-toolbar"><div className="filter-tabs">{['Todos', 'En stock', 'Stock bajo'].map((f) => <button key={f} className={filter === f ? 'active' : ''} onClick={() => setFilter(f)}>{f}{f === 'Stock bajo' && <span className="filter-count">{products.filter((p) => number(p.stock) - number(p.reserved) <= number(p.min_stock)).length}</span>}</button>)}</div><div className="inventory-tools"><span>{search ? `${filtered.length} resultados` : `${filtered.length} productos`}</span><button className="icon-button" aria-label="Descargar inventario" title="Descargar CSV" onClick={() => downloadCsv('inventario.csv', [['SKU', 'Producto', 'Categoría', 'Proveedor', 'Stock', 'Reservado', 'Mínimo', 'Ubicación'], ...filtered.map((p) => [p.sku, p.name, p.category, p.supplier, p.stock, p.reserved, p.min_stock, locations.find((bin) => bin.products.some((stock) => stock.productId === p.id))?.code ?? ''])])}><Download size={17} /></button></div></div>
       <div className="table-wrap inventory-table"><table><thead><tr><th>PRODUCTO</th><th>CATEGORÍA</th><th>SKU / CÓDIGO</th><th>STOCK DISPONIBLE</th><th>UBICACIÓN</th><th>ESTADO</th><th /></tr></thead><tbody>
@@ -1289,9 +1428,9 @@ function RackCreationForm({ initialAisleId, initialWidth, initialDepth, maxWidth
   </form>;
 }
 
-function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin, editing, saving, onBack, onSelect, onMoveStock, onSaveExpected, onChange, onDelete, onSave, onDiscard }: {
+function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin, canMoveStock, editing, saving, onBack, onSelect, onMoveStock, onSaveExpected, onChange, onDelete, onSave, onDiscard }: {
   rack: Rack; locations: Location[]; selected: Location | null; products: Product[]; warehouseId: string;
-  isAdmin: boolean; editing: boolean; saving: boolean;
+  isAdmin: boolean; canMoveStock: boolean; editing: boolean; saving: boolean;
   onBack: () => void; onSelect: (location: Location | null) => void;
   onMoveStock: (location: Location) => void;
   onSaveExpected: (locationId: string, expected: { productId: string; quantity: number }[]) => Promise<boolean>;
@@ -1328,7 +1467,7 @@ function Rack3DView({ rack, locations, selected, products, warehouseId, isAdmin,
             </div>{showExpectedContent && <ExpectedContentsPanel location={currentBin} />}
             {showExpectedContent && isAdmin && <button className="button button-secondary full-button" onClick={() => setEditingExpectedLocationId(currentBin.id)}><Pencil size={14} /> Editar contenido esperado</button>}
             {showExpectedContent && editingExpectedLocationId === currentBin.id && <ExpectedContentEditor key={currentBin.id} location={currentBin} products={products} onSave={onSaveExpected} onCancel={() => setEditingExpectedLocationId(null)} />}
-            <button className="button button-primary full-button" disabled={!currentBin.products.some((product) => number(product.quantity) > 0)} onClick={() => onMoveStock(currentBin)}><ArrowLeftRight size={15} /> Mover productos</button>
+            {canMoveStock && <button className="button button-primary full-button" disabled={!currentBin.products.some((product) => number(product.quantity) > 0)} onClick={() => onMoveStock(currentBin)}><ArrowLeftRight size={15} /> Mover productos</button>}
           </> : <div className="location-placeholder"><div className="placeholder-icon"><Package size={21} /></div><h3>Estantería completa</h3><p>Se muestran las ubicaciones de suelo y las cajas ocupadas. Selecciona una caja para consultar su contenido.</p><span className="rack3d-unit-pill">{formatNumber(rack.units)} unidades en esta estantería</span></div>}
       </aside>
     </section>
@@ -1639,9 +1778,9 @@ export function LegacyMapPage({ locations, racks, selected, isAdmin, onSelect, o
   </>;
 }
 
-function MapPage({ products, locations, racks, warehouse, aisles, selected, initialRackId, isAdmin, onSelect, onRefresh, onNotify, onMoveStock, onSaveExpected, onEditingChange }: {
+function MapPage({ products, locations, racks, warehouse, aisles, selected, initialRackId, isAdmin, canMoveStock, onSelect, onRefresh, onNotify, onMoveStock, onSaveExpected, onEditingChange }: {
   products: Product[]; locations: Location[]; racks: Rack[]; warehouse: WarehouseMap; aisles: Aisle[];
-  selected: Location | null; initialRackId: string | null; isAdmin: boolean; onSelect: (location: Location | null) => void;
+  selected: Location | null; initialRackId: string | null; isAdmin: boolean; canMoveStock: boolean; onSelect: (location: Location | null) => void;
   onRefresh: () => Promise<void>; onNotify: (message: string) => void; onMoveStock: (location: Location) => void;
   onSaveExpected: (locationId: string, expected: { productId: string; quantity: number }[]) => Promise<boolean>;
   onEditingChange: (editing: boolean) => void
@@ -2040,6 +2179,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
     products={products}
     warehouseId={warehouse.id}
     isAdmin={isAdmin}
+    canMoveStock={canMoveStock}
     editing={editMode}
     saving={saving}
     onBack={() => { setSelectedRackId(null); onSelect(null); }}
@@ -2159,7 +2299,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
         <div className="map-footer"><span><ShieldCheck size={15} />{editMode ? 'Cambios pendientes: guarda o descarta para salir' : 'Estanterías y perímetro vinculados al almacén'}</span><span>{canvasWidth} × {canvasHeight} cm</span></div>
       </section>
       <aside className="panel location-panel">
-        {selected ? <><div className="location-heading"><div><span className="eyebrow">UBICACIÓN</span><h2>{selected.code}</h2></div><button className="icon-button" aria-label="Cerrar ubicación" onClick={() => onSelect(null)}><X size={17} /></button></div><div className="location-stats"><div><span>Unidades</span><strong>{formatNumber(selected.quantity)}</strong></div><div><span>Ubicación</span><strong>{selected.level_number === 0 ? 'Suelo' : `Nivel ${selected.level_number}`}</strong></div></div><div className="location-products">{selected.products.map((product) => <div className="location-product" key={`${product.productId}-${product.lot}`}><div><strong>{product.name}</strong><small>{product.sku}</small></div><b>{formatNumber(product.quantity)} uds.</b></div>)}{!selected.products.length && <div className="location-empty">Ubicación disponible.</div>}</div><button className="button button-primary full-button" onClick={() => onMoveStock(selected)}><ArrowLeftRight size={16} /> Mover stock</button></>
+        {selected ? <><div className="location-heading"><div><span className="eyebrow">UBICACIÓN</span><h2>{selected.code}</h2></div><button className="icon-button" aria-label="Cerrar ubicación" onClick={() => onSelect(null)}><X size={17} /></button></div><div className="location-stats"><div><span>Unidades</span><strong>{formatNumber(selected.quantity)}</strong></div><div><span>Ubicación</span><strong>{selected.level_number === 0 ? 'Suelo' : `Nivel ${selected.level_number}`}</strong></div></div><div className="location-products">{selected.products.map((product) => <div className="location-product" key={`${product.productId}-${product.lot}`}><div><strong>{product.name}</strong><small>{product.sku}</small></div><b>{formatNumber(product.quantity)} uds.</b></div>)}{!selected.products.length && <div className="location-empty">Ubicación disponible.</div>}</div>{canMoveStock && <button className="button button-primary full-button" onClick={() => onMoveStock(selected)}><ArrowLeftRight size={16} /> Mover stock</button>}</>
           : <div className="location-placeholder"><div className="placeholder-icon"><Map size={21} /></div><h3>Selecciona una estantería</h3><p>Elige una estantería del plano para consultar sus niveles y ubicaciones en 3D.</p></div>}
       </aside>
     </div>
@@ -2169,7 +2309,7 @@ function MapPage({ products, locations, racks, warehouse, aisles, selected, init
   </>;
 }
 
-function MovementsPage({ movements, onAdd, onExport }: { movements: Movement[]; onAdd: () => void; onExport: () => void }) {
+function MovementsPage({ movements, canCreateMovement, onAdd, onExport }: { movements: Movement[]; canCreateMovement: boolean; onAdd: () => void; onExport: () => void }) {
   const [filter, setFilter] = useState('Todos');
   const filtered = movements.filter((movement) => {
     if (filter === 'Entradas') return movement.type === 'receipt' || movement.type === 'return';
@@ -2178,7 +2318,7 @@ function MovementsPage({ movements, onAdd, onExport }: { movements: Movement[]; 
     return true;
   });
   return <>
-    <PageIntro eyebrow="TRAZABILIDAD Y KARDEX" title="Movimientos" description="Historial de entradas, salidas, transferencias, artículos en uso y devoluciones." actions={<><button className="button button-secondary" onClick={onExport}><Download size={16} /> Exportar</button><button className="button button-primary" onClick={onAdd}><Plus size={17} /> Registrar movimiento</button></>} />
+    <PageIntro eyebrow="TRAZABILIDAD Y KARDEX" title="Movimientos" description="Historial de entradas, salidas, transferencias, artículos en uso y devoluciones." actions={<><button className="button button-secondary" onClick={onExport}><Download size={16} /> Exportar</button>{canCreateMovement && <button className="button button-primary" onClick={onAdd}><Plus size={17} /> Registrar movimiento</button>}</>} />
     <section className="panel movement-history"><div className="inventory-toolbar"><div className="filter-tabs">{['Todos', 'Entradas', 'Salidas', 'Transferencias'].map((name) => <button key={name} className={filter === name ? 'active' : ''} onClick={() => setFilter(name)}>{name}</button>)}</div><div className="inventory-tools"><span>{filtered.length} movimientos</span></div></div><MovementTable movements={filtered} /><div className="table-footer"><span>Mostrando <strong>{filtered.length}</strong> movimientos</span><span><ShieldCheck size={14} /> Registro auditado</span></div></section>
   </>;
 }
@@ -2355,18 +2495,23 @@ function ProductForm({ initial, categories, suppliers, onSubmit, onCancel }: { i
   </form>;
 }
 
-function MovementForm({ products, locations, racks, warehouses, inUseLoans, currentWarehouseId, isAdmin, initialType, initialFromBinId, saving, onSubmit, onCancel }: {
+function MovementForm({ products, locations, racks, warehouses, inUseLoans, currentWarehouseId, isAdmin, enabledMovementTypes, initialType, initialFromBinId, saving, onSubmit, onCancel }: {
   products: Product[]; locations: Location[]; racks: Rack[]; warehouses: Warehouse[];
   inUseLoans: InUseLoan[];
-  currentWarehouseId: string; isAdmin: boolean; initialType?: string; initialFromBinId?: string;
+  currentWarehouseId: string; isAdmin: boolean; enabledMovementTypes: EmployeePanelConfig['movementTypes'];
+  initialType?: string; initialFromBinId?: string;
   saving: boolean;
   onSubmit: (event: FormEvent<HTMLFormElement>) => void; onCancel: () => void
 }) {
-  type MovementType = 'receipt' | 'dispatch' | 'transfer' | 'adjustment' | 'in_use' | 'return';
   type LocationRole = 'from' | 'to';
-  const [type, setType] = useState<MovementType>(
-    isAdmin ? (initialType as MovementType | undefined) ?? 'receipt' : initialType === 'return' ? 'return' : 'in_use'
-  );
+  const allowedEmployeeTypes = employeeMovementTypes.filter((movementType) => enabledMovementTypes[movementType]);
+  const defaultEmployeeType = allowedEmployeeTypes.find((movementType) => movementType === initialType)
+    ?? allowedEmployeeTypes[0]
+    ?? 'in_use';
+  const initialMovementType = isAdmin
+    ? employeeMovementTypes.find((movementType) => movementType === initialType) ?? 'receipt'
+    : defaultEmployeeType;
+  const [type, setType] = useState<EmployeeMovementType>(initialMovementType);
   const [step, setStep] = useState<1 | 2 | 3 | 4>(1);
   const [adjustmentDirection, setAdjustmentDirection] = useState<'increase' | 'decrease'>('increase');
   const [productId, setProductId] = useState('');
@@ -2520,7 +2665,7 @@ function MovementForm({ products, locations, racks, warehouses, inUseLoans, curr
 
     {step === 1 && <div className="movement-step-content">
       <label>¿Qué movimiento vas a registrar?<select value={type} onChange={(event) => {
-        setType(event.target.value as MovementType);
+        setType(event.target.value as EmployeeMovementType);
         setProductId('');
         setLoanId('');
         setFromBinId('');
@@ -2529,9 +2674,9 @@ function MovementForm({ products, locations, racks, warehouses, inUseLoans, curr
         setLocationRole(event.target.value === 'receipt' || event.target.value === 'return' ? 'to' : 'from');
         setDestinationWarehouseId(currentWarehouseId);
         setAdjustmentDirection('increase');
-      }}>{isAdmin
-        ? <><option value="receipt">Entrada</option><option value="dispatch">Salida</option><option value="transfer">Transferencia</option><option value="adjustment">Ajuste de inventario</option><option value="in_use">En uso</option><option value="return">Devolución</option></>
-        : <><option value="in_use">En uso</option><option value="return">Devolución</option></>}</select></label>
+      }}>{employeeMovementTypes.filter((movementType) => isAdmin || enabledMovementTypes[movementType]).map((movementType) =>
+        <option key={movementType} value={movementType}>{movementNames[movementType]}</option>
+      )}</select></label>
       {type === 'adjustment' && <label>Tipo de ajuste<select value={adjustmentDirection} onChange={(event) => setAdjustmentDirection(event.target.value as 'increase' | 'decrease')}><option value="increase">Incrementar stock</option><option value="decrease">Descontar stock</option></select></label>}
       <p className="form-hint">{type === 'transfer' ? 'Se elegirán primero la ubicación de origen y después la de destino. El mismo SKU debe existir en ambos almacenes.' : type === 'in_use' ? 'Se descontará el artículo del stock disponible y quedará pendiente de devolución.' : type === 'return' ? 'Elige un artículo pendiente; puedes registrar una devolución parcial.' : 'A continuación elegirás el producto y su ubicación en el almacén.'}</p>
       <div className="form-actions"><button type="button" className="button button-secondary" onClick={onCancel}>Cancelar</button><button type="button" className="button button-primary" onClick={() => setStep(2)}>Continuar <ChevronRight size={15} /></button></div>

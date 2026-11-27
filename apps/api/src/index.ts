@@ -29,9 +29,64 @@ app.use(cors({
 app.use(express.json());
 
 type SessionUser = { id: string; name: string; email: string; role: 'admin' | 'employee' };
+const employeePanelConfigKey = 'employee_panel_config';
+const employeePanelConfigSchema = z.object({
+  sections: z.object({
+    inventory: z.boolean(),
+    map: z.boolean(),
+    movements: z.boolean(),
+    purchasing: z.boolean(),
+    salesOrders: z.boolean(),
+    assistant: z.boolean()
+  }).strict(),
+  movementTypes: z.object({
+    receipt: z.boolean(),
+    dispatch: z.boolean(),
+    transfer: z.boolean(),
+    adjustment: z.boolean(),
+    in_use: z.boolean(),
+    return: z.boolean()
+  }).strict()
+}).strict();
+type EmployeePanelConfig = z.infer<typeof employeePanelConfigSchema>;
+const defaultEmployeePanelConfig: EmployeePanelConfig = {
+  sections: {
+    inventory: true,
+    map: true,
+    movements: true,
+    purchasing: true,
+    salesOrders: true,
+    assistant: true
+  },
+  movementTypes: {
+    receipt: false,
+    dispatch: false,
+    transfer: false,
+    adjustment: false,
+    in_use: true,
+    return: true
+  }
+};
 const sessionDurationMs = 8 * 60 * 60 * 1000;
 const loginAttempts = new Map<string, { count: number; resetAt: number }>();
 const registrationAttempts = new Map<string, { count: number; resetAt: number }>();
+
+async function getEmployeePanelConfig(): Promise<EmployeePanelConfig> {
+  const result = await pool.query<{ value: string }>(
+    'SELECT value FROM app_settings WHERE key = $1',
+    [employeePanelConfigKey]
+  );
+  if (!result.rowCount) return defaultEmployeePanelConfig;
+  let value: unknown;
+  try {
+    value = JSON.parse(result.rows[0].value);
+  } catch {
+    throw new Error('La configuración del panel de empleados no contiene JSON válido');
+  }
+  const parsed = employeePanelConfigSchema.safeParse(value);
+  if (!parsed.success) throw new Error('La configuración del panel de empleados no es válida');
+  return parsed.data;
+}
 
 function hashPassword(password: string): Promise<string> {
   const salt = randomBytes(16);
@@ -400,6 +455,31 @@ const requireWarehouse: RequestHandler = (req, res, next) => {
 };
 
 app.use('/api', requireWarehouse);
+
+app.get('/api/employee-panel-config', async (_req, res, next) => {
+  try {
+    res.json(await getEmployeePanelConfig());
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.put('/api/admin/employee-panel-config', requireAdmin, async (req, res, next) => {
+  const parsed = employeePanelConfigSchema.safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Configuración del panel de empleados no válida' });
+  try {
+    const result = await pool.query(
+      `INSERT INTO app_settings (key, value)
+       VALUES ($1, $2)
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = now()
+       RETURNING value`,
+      [employeePanelConfigKey, JSON.stringify(parsed.data)]
+    );
+    res.json(employeePanelConfigSchema.parse(JSON.parse(result.rows[0].value)));
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.get('/api/users', requireAdmin, async (_req, res, next) => {
   try {
@@ -2166,8 +2246,15 @@ app.post('/api/movements', async (req, res, next) => {
   }
   const input = parsed.data;
   const user = res.locals.authUser as SessionUser;
-  if (user.role === 'employee' && input.type !== 'in_use' && input.type !== 'return')
-    return res.status(403).json({ error: 'Los empleados solo pueden registrar movimientos «En uso» o «Devolución»' });
+  if (user.role === 'employee') {
+    try {
+      const panelConfig = await getEmployeePanelConfig();
+      if (!panelConfig.sections.movements || !panelConfig.movementTypes[input.type])
+        return res.status(403).json({ error: 'Esta operación no está habilitada para los empleados' });
+    } catch (error) {
+      return next(error);
+    }
+  }
   const warehouseId = res.locals.warehouseId as string;
   const destinationWarehouseId = input.type === 'transfer'
     ? input.destinationWarehouseId ?? warehouseId
@@ -3074,7 +3161,11 @@ app.post('/api/assistant', async (req, res, next) => {
   if (!question.success) return res.status(400).json({ error: 'Escribe una consulta válida' });
   try {
     const warehouseId = res.locals.warehouseId as string;
-    const text = question.data.toLocaleLowerCase('es');
+    const normalizeSearchText = (value: string) => value
+      .toLocaleLowerCase('es')
+      .normalize('NFD')
+      .replace(/\p{M}/gu, '');
+    const text = normalizeSearchText(question.data);
     const stopWords = new Set([
       'donde', 'dónde', 'esta', 'está', 'ubicacion', 'ubicación', 'localizacion', 'localización',
       'de', 'del', 'el', 'la', 'los', 'las', 'un', 'una', 'unos', 'unas', 'producto', 'productos',
@@ -3083,12 +3174,40 @@ app.post('/api/assistant', async (req, res, next) => {
       'localiza', 'localizar', 'dime', 'decir', 'saber', 'puedes', 'puede', 'quiero', 'informacion',
       'información', 'muestra', 'muéstrame', 'por', 'favor', 'que', 'qué', 'cual', 'cuál', 'es', 'me',
       'se', 'nombre', 'nombres'
-    ]);
-    const searchTerms = question.data
-      .toLocaleLowerCase('es')
+    ].map(normalizeSearchText));
+    const searchTerms = [...new Set(text
       .replace(/[^\p{L}\p{N}]+/gu, ' ')
       .split(/\s+/)
-      .filter((term) => term.length > 1 && !stopWords.has(term));
+      .filter((term) => term.length > 1 && !stopWords.has(term)))];
+    const normalizedNameSql = "unaccent(lower(regexp_replace(p.name, '[^[:alnum:]]+', ' ', 'g')))";
+    const normalizedSkuSql = "unaccent(lower(regexp_replace(p.sku, '[^[:alnum:]]+', ' ', 'g')))";
+    const termMatchSql = `(
+      ${normalizedNameSql} LIKE '%' || query_term.term || '%'
+      OR ${normalizedSkuSql} LIKE '%' || query_term.term || '%'
+      OR to_tsvector('spanish', unaccent(p.name)) @@ plainto_tsquery('spanish', query_term.term)
+      OR to_tsvector('simple', unaccent(p.sku)) @@ plainto_tsquery('simple', query_term.term)
+      OR (
+        length(query_term.term) >= 4
+        AND greatest(
+          word_similarity(query_term.term, ${normalizedNameSql}),
+          word_similarity(query_term.term, ${normalizedSkuSql})
+        ) >= CASE WHEN length(query_term.term) <= 5 THEN 0.35 ELSE 0.28 END
+      )
+    )`;
+    const searchScoreSql = (termsParameter: string) => `(
+      SELECT COALESCE(sum(CASE
+        WHEN ${normalizedNameSql} LIKE '%' || query_term.term || '%'
+          OR ${normalizedSkuSql} LIKE '%' || query_term.term || '%' THEN 4
+        WHEN to_tsvector('spanish', unaccent(p.name)) @@ plainto_tsquery('spanish', query_term.term)
+          OR to_tsvector('simple', unaccent(p.sku)) @@ plainto_tsquery('simple', query_term.term) THEN 3
+        ELSE greatest(
+          word_similarity(query_term.term, ${normalizedNameSql}),
+          word_similarity(query_term.term, ${normalizedSkuSql})
+        )
+      END), 0)
+      FROM unnest(${termsParameter}::text[]) AS query_term(term)
+      WHERE ${termMatchSql}
+    )`;
     if (process.env.OPENAI_API_KEY) {
       const context = await pool.query(`
         SELECT p.sku, p.name, p.min_stock,
@@ -3106,12 +3225,7 @@ app.post('/api/assistant', async (req, res, next) => {
         LEFT JOIN warehouses w ON w.id = z.warehouse_id
         LEFT JOIN lots l ON l.id = sb.lot_id
         WHERE p.active AND p.warehouse_id = $1 AND (sb.bin_id IS NULL OR z.warehouse_id = $1)
-        ORDER BY CASE WHEN cardinality($2::text[]) > 0 AND (
-          SELECT count(*) FROM unnest($2::text[]) AS query_term(term)
-          WHERE p.name ILIKE '%' || query_term.term || '%'
-             OR to_tsvector('spanish', p.name) @@ plainto_tsquery('spanish', query_term.term)
-             OR p.sku ILIKE '%' || query_term.term || '%'
-        ) = cardinality($2::text[]) THEN 0 ELSE 1 END,
+        ORDER BY ${searchScoreSql('$2')} DESC,
           p.name, l.received_at ASC NULLS LAST
         LIMIT 100
       `, [warehouseId, searchTerms]);
@@ -3190,12 +3304,10 @@ app.post('/api/assistant', async (req, res, next) => {
         WHERE p.active AND p.warehouse_id = $2 AND (sb.bin_id IS NULL OR z.warehouse_id = $2)
           AND (
             cardinality($1::text[]) = 0
-            OR (SELECT count(*) FROM unnest($1::text[]) AS query_term(term)
-                WHERE p.name ILIKE '%' || query_term.term || '%'
-                   OR to_tsvector('spanish', p.name) @@ plainto_tsquery('spanish', query_term.term)
-                   OR p.sku ILIKE '%' || query_term.term || '%') = cardinality($1::text[])
+            OR ${searchScoreSql('$1')} > 0
           )
-        GROUP BY p.name, p.sku, w.name, z.name, a.code, r.code, rl.level_number, b.code ORDER BY p.name LIMIT 10
+        GROUP BY p.name, p.sku, w.name, z.name, a.code, r.code, rl.level_number, b.code
+        ORDER BY ${searchScoreSql('$1')} DESC, p.name LIMIT 10
       `, [searchTerms, warehouseId]);
       answer = result.rows.length
         ? result.rows.map((r) => `${r.name} (${r.sku}): ${r.quantity} uds.${r.location ? ` en ${r.location}` : ' sin stock ubicado'}`).join('\n')
@@ -3346,6 +3458,10 @@ async function start() {
       WHERE z.warehouse_id = (SELECT id FROM warehouses ORDER BY created_at, name LIMIT 1)
         AND NOT EXISTS (SELECT 1 FROM aisles a WHERE a.zone_id = z.id);
     `);
+    await pool.query(
+      'INSERT INTO app_settings (key, value) VALUES ($1, $2) ON CONFLICT (key) DO NOTHING',
+      [employeePanelConfigKey, JSON.stringify(defaultEmployeePanelConfig)]
+    );
     const bootstrap = await pool.query("SELECT value FROM app_settings WHERE key = 'demo_users_bootstrapped'");
     if (!bootstrap.rowCount) {
       const adminPassword = process.env.ADMIN_PASSWORD ?? (isProduction ? '' : 'Stockflow2026!');

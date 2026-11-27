@@ -539,8 +539,9 @@ tbody tr:last-child td { border-bottom: 0; }
 .rack-bin-name { display: block; padding: 3px 7px; transform: rotate(-2deg); border: 1px solid #d8c99a; border-radius: 2px; background: linear-gradient(135deg, #fffdf2, #f8edc8); color: #25362c; box-shadow: 0 2px 4px #10271a40; font-size: 10.8px; font-weight: 700; }
 .rack-bin-name.in-use { border-color: #e6c58e; color: #79551f; background: #fff1d2; }
 .settings-grid { display: grid; grid-template-columns: minmax(300px, .9fr) minmax(0, 1.1fr); gap: 15px; align-items: start; }
-.settings-account, .team-panel, .employee-permissions, .catalog-management { overflow: hidden; }
+.settings-account, .team-panel, .employee-permissions, .catalog-management, .employee-panel-admin { overflow: hidden; }
 .catalog-management { grid-column: 1 / -1; }
+.employee-panel-admin { grid-column: 1 / -1; }
 .catalog-management-columns { padding: 0 15px 15px; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 18px; }
 .catalog-management-group h3 { margin: 0 0 9px; display: flex; align-items: center; gap: 7px; color: #48594e; font-size: 12px; }
 .catalog-management-group h3 span { color: #87958c; font-size: 9.6px; font-weight: 500; }
@@ -596,6 +597,22 @@ tbody tr:last-child td { border-bottom: 0; }
 .team-footnote { padding: 10px 15px; display: flex; align-items: center; gap: 6px; border-top: 1px solid #edf1ee; color: #89968e; font-size: 9.6px; }
 .employee-permissions { padding-bottom: 15px; }
 .employee-permissions > p { padding: 0 16px; color: #86938b; font-size: 10.8px; line-height: 1.65; }
+.employee-panel-editor { padding: 0 16px 16px; display: grid; gap: 18px; }
+.employee-panel-option-group h3 { margin: 0 0 9px; color: #48594e; font-size: 13px; }
+.employee-panel-switch-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.employee-panel-switch-row { min-width: 0; min-height: 58px; padding: 9px 11px; display: flex; align-items: center; justify-content: space-between; gap: 12px; border: 1px solid #e8eeea; border-radius: 7px; background: #fff; cursor: pointer; }
+.employee-panel-switch-row:hover { border-color: #c9ded0; background: #fbfdfb; }
+.employee-panel-switch-copy { min-width: 0; display: grid; gap: 3px; }
+.employee-panel-switch-copy strong { color: #3d4c43; font-size: 12px; }
+.employee-panel-switch-copy small { color: #87948c; font-size: 10px; line-height: 1.4; }
+.employee-panel-switch-control { position: relative; width: 40px; height: 23px; flex: 0 0 40px; }
+.employee-panel-switch-control input { position: absolute; z-index: 1; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.employee-panel-switch-track { position: absolute; inset: 0; border-radius: 20px; background: #d7dfda; transition: background .15s; }
+.employee-panel-switch-track::after { position: absolute; top: 3px; left: 3px; width: 17px; height: 17px; border-radius: 50%; background: #fff; box-shadow: 0 1px 3px #18362430; content: ''; transition: transform .15s; }
+.employee-panel-switch-control input:checked + .employee-panel-switch-track { background: #21865d; }
+.employee-panel-switch-control input:checked + .employee-panel-switch-track::after { transform: translateX(17px); }
+.employee-panel-switch-control input:focus-visible + .employee-panel-switch-track { outline: 2px solid #176a48; outline-offset: 2px; }
+.employee-panel-note { margin: 10px 0 0; color: #7e8d83; font-size: 10.8px; line-height: 1.5; }
 .login-page { min-height: 100vh; padding: 25px; display: grid; place-items: center; background: radial-gradient(ellipse at 50% 20%, #edf6ef, #f5f7f6 60%); }
 .login-card { width: min(410px, 100%); padding: 30px; border: 1px solid #e7ede9; border-radius: 12px; background: white; box-shadow: 0 18px 65px #193c2910; }
 .login-brand { margin-bottom: 30px; display: flex; align-items: center; gap: 10px; color: #16362a; font: 800 25.2px 'Manrope', sans-serif; letter-spacing: -1px; }
@@ -765,6 +782,7 @@ tbody tr:last-child td { border-bottom: 0; }
   .employee-alert-row { grid-template-columns: minmax(0, 1fr); gap: 5px; }
   .employee-alert-row time { text-align: left; }
   .catalog-management-columns { grid-template-columns: 1fr; }
+  .employee-panel-switch-grid { grid-template-columns: 1fr; }
   .inventory-toolbar { align-items: flex-start; flex-direction: column; padding-top: 5px; }
   .filter-tabs { min-height: 40px; gap: 14px; }
   .inventory-tools { align-self: flex-end; margin-bottom: 8px; }
