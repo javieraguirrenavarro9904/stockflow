@@ -334,7 +334,7 @@ export default function WarehouseMap2D({
               x={structure.x + structure.width / 2}
               y={structure.y + structure.height / 2}
               fill="#815d24"
-              fontSize="55"
+              fontSize="66"
               fontWeight="700"
               textAnchor="middle"
               dominantBaseline="middle"
@@ -388,7 +388,7 @@ export default function WarehouseMap2D({
                 x={centerX}
                 y={centerY - 35}
                 fill="#283b30"
-                fontSize={Math.max(20, Math.min(140, rackWidth * 0.72 / Math.max(1, rack.name.length * 0.56)))}
+                fontSize={Math.max(24, Math.min(168, rackWidth * 0.72 / Math.max(1, rack.name.length * 0.56) * 1.2))}
                 fontWeight="700"
                 textAnchor="middle"
                 dominantBaseline="middle"
@@ -399,7 +399,7 @@ export default function WarehouseMap2D({
                 x={centerX}
                 y={centerY + 100}
                 fill="#65736a"
-                fontSize="70"
+                fontSize="84"
                 textAnchor="middle"
                 dominantBaseline="middle"
               >{Math.round(occupancy * 100)}%</text>
@@ -410,7 +410,7 @@ export default function WarehouseMap2D({
             </g>
           );
         })}
-        {!racks.length && <text x={width / 2} y={height / 2} fill="#97a39c" fontSize="110" textAnchor="middle" dominantBaseline="middle">Activa “Editar plano” y añade una estantería.</text>}
+        {!racks.length && <text x={width / 2} y={height / 2} fill="#97a39c" fontSize="132" textAnchor="middle" dominantBaseline="middle">Activa “Editar plano” y añade una estantería.</text>}
       </svg>
     </div>
   );
